@@ -1,0 +1,8 @@
+# netlify.toml
+[build]
+  base    = "gtfs-builder"      # where index.html and package.json live
+  command = "npm ci || npm i && npm run build"
+  publish = "gtfs-builder/dist" # what to deploy
+
+[build.environment]
+  NODE_VERSION = "18"
