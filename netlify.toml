@@ -1,8 +1,8 @@
-# netlify.toml
+# netlify.toml (at repo root)
 [build]
-  base    = "gtfs-builder"      # where index.html and package.json live
-  command = "npm ci || npm i && npm run build"
-  publish = "gtfs-builder/dist" # what to deploy
+  base    = "gtfs-builder"   # folder that contains index.html & package.json
+  command = "npm ci && npm run build"
+  publish = "dist"           # <-- publish is relative to base, so use "dist" (not gtfs-builder/dist)
 
 [build.environment]
-  NODE_VERSION = "18"
+  NODE_VERSION = "20.19.0"   # Vite 7 + plugin-react 5 require >=20.19
