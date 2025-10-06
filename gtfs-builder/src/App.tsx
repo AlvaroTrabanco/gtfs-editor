@@ -6,6 +6,12 @@ import { saveAs } from "file-saver";
 import { v4 as uuidv4 } from "uuid";
 
 
+
+const defaultTZ: string = String(
+  Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Madrid"
+);
+
+
 /** ---------- Types ---------- */
 type Stop = { uid: string; stop_id: string; stop_name: string; stop_lat: number; stop_lon: number; };
 type Agency = { agency_id: string; agency_name: string; agency_url: string; agency_timezone: string };
@@ -65,7 +71,8 @@ function validateFeed(ctx: FeedState): { errors: Issue[]; warnings: Issue[] } {
   const errors: Issue[] = [];
   const warnings: Issue[] = [];
 
-  const required = [
+    // was: const required = [ ... ]
+  const required: Array<[file: string, count: number]> = [
     ["agency.txt", ctx.agencies.length],
     ["stops.txt", ctx.stops.length],
     ["routes.txt", ctx.routes.length],
@@ -73,7 +80,16 @@ function validateFeed(ctx: FeedState): { errors: Issue[]; warnings: Issue[] } {
     ["stop_times.txt", ctx.stopTimes.length],
     ["calendar.txt", ctx.services.length],
   ];
-  for (const [name, count] of required) if (!count) errors.push({ level: "error", file: name, message: "File is required but empty." });
+
+  for (const [fileName, count] of required) {
+    if (!count) {
+      errors.push({
+        level: "error",
+        file: fileName, // <- now strictly string
+        message: "File is required but empty.",
+      });
+    }
+  }
 
   const dupCheck = <T, K extends keyof T>(rows: T[], key: K, file: string) => {
     const seen = new Set<any>();
@@ -188,12 +204,14 @@ function InvalidateSizeOnLoad() {
 /** ---------- App ---------- */
 export default function App() {
   // Data
-  const [agencies, setAgencies] = useState<Agency[]>([{
+  const [agencies, setAgencies] = useState<Agency[]>([
+  {
     agency_id: "agency_1",
     agency_name: "My Agency",
     agency_url: "https://example.com",
-    agency_timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Madrid",
-  }]);
+    agency_timezone: defaultTZ, // <-- guaranteed string
+  },
+]);
   const [stops, setStops] = useState<Stop[]>([]);
   const [routes, setRoutes] = useState<RouteRow[]>([]);
   const [services, setServices] = useState<Service[]>([{
