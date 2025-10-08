@@ -135,3 +135,14 @@ body {
 .stack { display: grid; gap: 12px; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .muted { color: var(--muted); font-size: 12px; }
+
+
+
+.route-halo-pulse {
+  animation: haloPulse 1.8s ease-in-out infinite !important, glowPulse 1.8s ease-in-out infinite !important;
+}
+@keyframes glowPulse {
+  0%   { filter: drop-shadow(0 0 3px rgba(255,255,255,0.9)); }
+  50%  { filter: drop-shadow(0 0 10px rgba(255,255,255,0.25)); }
+  100% { filter: drop-shadow(0 0 3px rgba(255,255,255,0.9)); }
+}

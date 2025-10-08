@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { MapContainer, TileLayer, Polyline, CircleMarker, useMapEvents, useMap } from "react-leaflet";
+import { MapContainer, TileLayer, Polyline, CircleMarker, useMapEvents, useMap, Pane } from "react-leaflet";
 import L from "leaflet";
 import JSZip from "jszip";
 import { saveAs } from "file-saver";
@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from "uuid";
 /** ---------- Misc ---------- */
 const defaultTZ: string = String(Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Madrid");
 const MIN_ADD_ZOOM = 15;
+const DIM_ROUTE_COLOR = "#2b2b2b"; // single gray for all non-selected routes
 
 /** ---------- Types ---------- */
 type Stop = { uid: string; stop_id: string; stop_name: string; stop_lat: number; stop_lon: number };
@@ -68,9 +69,9 @@ function uiFromGtfs(t: string | undefined): string {
 function gtfsFromUi(t: string | undefined): string {
   if (!t) return "";
   const trimmed = t.trim();
-  if (!trimmed) return ""; // empty cell allowed
+  if (!trimmed) return ""; // empty allowed
   const m = trimmed.match(/^(\d{1,2}):(\d{2})$/);
-  if (!m) return trimmed; // if user pasted full GTFS time, keep
+  if (!m) return trimmed; // allow pasting full GTFS time too
   const hh = m[1].padStart(2, "0");
   const mm = m[2];
   return `${hh}:${mm}:00`;
@@ -83,6 +84,7 @@ async function exportGTFSZip(payload: {
 }) {
   const zip = new JSZip();
 
+  // Skip any stop_times rows where both times are blank
   const filteredStopTimes = payload.stopTimes.filter(
     st => !!(st.arrival_time?.trim() || st.departure_time?.trim())
   );
@@ -191,6 +193,7 @@ function PaginatedEditableTable<T extends Record<string, any>>({
   selectedIcon = "✓",
   clearSignal = 0,
   onIconClick,
+  selectOnCellFocus = false, // NEW: focusing a cell selects the row
 }: {
   title: string;
   rows: T[];
@@ -202,6 +205,7 @@ function PaginatedEditableTable<T extends Record<string, any>>({
   selectedIcon?: string;
   clearSignal?: number;
   onIconClick?: (row: T) => void;
+  selectOnCellFocus?: boolean;
 }) {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<5|10|20|50|100>(initialPageSize);
@@ -322,8 +326,9 @@ function PaginatedEditableTable<T extends Record<string, any>>({
                       <td key={c} style={{ borderBottom: "1px solid #f3f3f3", padding: 4 }}>
                         <input
                           value={(r as any)[c] ?? ""}
+                          onFocus={selectOnCellFocus && onRowClick ? () => onRowClick(r) : undefined}
                           onChange={e => edit(gi, c, e.target.value)}
-                          onClick={(e) => e.stopPropagation()}
+                          // keep click propagation so full-row select still works when you click into inputs
                           style={{ width: "100%", outline: "none", border: "1px solid #e8e8e8", padding: "4px 6px", borderRadius: 8, background: "white" }}
                         />
                       </td>
@@ -411,7 +416,7 @@ function PatternMatrix({
   services,
   activeServiceIds,
   onEditTime,
-  onDeleteStopRow, // NEW
+  onDeleteStopRow,
 }: {
   route: RouteRow;
   trips: Trip[];
@@ -428,7 +433,24 @@ function PatternMatrix({
     return m;
   }, [stops]);
 
-  // stop_times by trip (sorted)
+  const serviceById = useMemo(() => {
+    const m = new Map<string, Service>();
+    for (const s of services) m.set(s.service_id, s);
+    return m;
+  }, [services]);
+
+  function daysString(svc?: Service) {
+    if (!svc) return "";
+    const flags = [svc.monday,svc.tuesday,svc.wednesday,svc.thursday,svc.friday,svc.saturday,svc.sunday];
+    const chars = ["M","T","W","T","F","S","S"];
+    return chars.map((c,i)=> flags[i] ? c : "·").join("");
+  }
+
+  function ymdDashed(yyyymmdd?: string) {
+    if (!yyyymmdd || yyyymmdd.length !== 8) return "";
+    return `${yyyymmdd.slice(0,4)}-${yyyymmdd.slice(4,6)}-${yyyymmdd.slice(6,8)}`;
+  }
+
   const stByTrip = useMemo(() => {
     const m = new Map<string, StopTime[]>();
     for (const st of stopTimes) {
@@ -443,7 +465,6 @@ function PatternMatrix({
     return m;
   }, [stopTimes]);
 
-  // Simplified unique stop sequence per trip
   const seqByTrip = useMemo(() => {
     const m = new Map<string, string[]>();
     for (const t of trips) {
@@ -459,7 +480,6 @@ function PatternMatrix({
     return m;
   }, [trips, stByTrip]);
 
-  // Representatives (maximal sequences)
   const reps = useMemo(() => {
     const uniq: string[][] = [];
     for (const t of trips) {
@@ -470,12 +490,11 @@ function PatternMatrix({
     for (const s of uniq) {
       let sub = false;
       for (const t of uniq) { if (s === t) continue; if (isSubsequence(s, t)) { sub = true; break; } }
-      if (!sub) out.push(s);
+    if (!sub) out.push(s);
     }
     return out.length ? out : uniq;
   }, [trips, seqByTrip]);
 
-  // dep_map (trip -> stop -> time)
   const depMapByTrip = useMemo(() => {
     const m = new Map<string, Map<string, string>>();
     for (const t of trips) {
@@ -491,18 +510,20 @@ function PatternMatrix({
   }, [trips, stByTrip]);
 
   const headerFor = (t: Trip) => {
-    const parts = [t.trip_id];
-    const meta: string[] = [];
-    if (t.service_id) meta.push(`svc ${t.service_id}`);
-    if (t.trip_headsign) {
-      const h = `${t.trip_headsign}`.trim();
-      meta.push(h.length > 40 ? h.slice(0, 37) + "..." : h);
-    }
-    if (meta.length) parts.push(`(${meta.join(" ; ")})`);
-    return parts.join(" ");
-  };
+  const svc = serviceById.get(t.service_id);
+  const days = daysString(svc);
+  const range = svc ? `${ymdDashed(svc.start_date)}/${ymdDashed(svc.end_date)}` : "";
+  return (
+    <div style={{lineHeight:1.15, whiteSpace:"normal"}}>
+      <div style={{fontWeight:700}}>{t.trip_id}</div>
+      <div>{t.service_id}</div>
+      <div style={{opacity:.7}}>
+        {days || range ? `(${[days, range].filter(Boolean).join(" ")})` : ""}
+      </div>
+    </div>
+  );
+};
 
-  // One pattern table block
   const PatternBlock = ({ idx, seq, groupTrips }: { idx: number; seq: string[]; groupTrips: Trip[] }) => {
     const [isEditing, setIsEditing] = useState(false);
     const [colOrder, setColOrder] = useState<string[] | null>(null);
@@ -510,27 +531,35 @@ function PatternMatrix({
     if (!seq.length || !groupTrips.length) return null;
     const first = seq[0];
 
-    // Filter by services
     const filteredTrips = useMemo(
       () => groupTrips.filter(t => activeServiceIds.size ? activeServiceIds.has(t.service_id) : true),
       [groupTrips, activeServiceIds]
     );
 
-    // Base sort by first stop time
     const baseSortedIds = useMemo(() => {
-      const firstTimes = new Map<string, string>();
+      const firstTimes = new Map<string, string>(); // trip_id -> HH:MM:SS or ""
       for (const t of filteredTrips) {
         const tm = depMapByTrip.get(t.trip_id)?.get(first) ?? "";
         firstTimes.set(t.trip_id, tm);
       }
       const ids = filteredTrips.map(t => t.trip_id);
       ids.sort((a, b) => {
-        const ta = firstTimes.get(a) ?? "";
-        const tb = firstTimes.get(b) ?? "";
-        if (ta === "" && tb === "") return a.localeCompare(b);
-        if (ta === "") return 1;
-        if (tb === "") return -1;
-        return ta.localeCompare(tb) || a.localeCompare(b);
+        const ta = filteredTrips.find(t => t.trip_id === a)!;
+        const tb = filteredTrips.find(t => t.trip_id === b)!;
+
+        // 1) by service_id (string compare)
+        if (ta.service_id !== tb.service_id) return ta.service_id.localeCompare(tb.service_id);
+
+        // 2) by first departure time (empty times last)
+        const fa = firstTimes.get(a) ?? "";
+        const fb = firstTimes.get(b) ?? "";
+        if (fa === "" && fb === "") return a.localeCompare(b);
+        if (fa === "") return 1;
+        if (fb === "") return -1;
+        if (fa !== fb) return fa.localeCompare(fb);
+
+        // 3) tie-breaker by trip_id
+        return a.localeCompare(b);
       });
       return ids;
     }, [filteredTrips, depMapByTrip, first]);
@@ -543,7 +572,6 @@ function PatternMatrix({
       return filteredTrips.slice().sort((ta, tb) => (idxMap.get(ta.trip_id)! - idxMap.get(tb.trip_id)!));
     }, [filteredTrips, colOrder]);
 
-    // Drop non-monotonic only when NOT editing
     if (!isEditing) {
       orderedTrips = orderedTrips.filter(t => {
         const times = seq.map(sid => depMapByTrip.get(t.trip_id)?.get(sid));
@@ -552,7 +580,6 @@ function PatternMatrix({
       if (!orderedTrips.length) return null;
     }
 
-    // Editable cell: local draft, commit on blur/Enter; UI shows HH:MM; empty allowed
     const TimeCell = ({ tripId, stopId }: { tripId: string; stopId: string }) => {
       const source = depMapByTrip.get(tripId)?.get(stopId) ?? "";
       const [draft, setDraft] = useState(uiFromGtfs(source));
@@ -576,7 +603,6 @@ function PatternMatrix({
       );
     };
 
-    // Delete stop row button (removes this stop from all trips in this block)
     const DeleteRowBtn = ({ stopId }: { stopId: string }) => (
       <button
         title="Delete stop from these trips"
@@ -603,7 +629,7 @@ function PatternMatrix({
                   <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee", width: 180 }}>stop_id</th>
                   <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee", width: 260 }}>stop_name</th>
                   {orderedTrips.map(t => (
-                    <th key={t.trip_id} style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>
+                    <th key={t.trip_id} style={{ textAlign:"left", padding:8, borderBottom:"1px solid #eee", minWidth:150 }}>
                       {headerFor(t)}
                     </th>
                   ))}
@@ -993,6 +1019,20 @@ export default function App() {
   const handleEditTime = (trip_id: string, stop_id: string, newTime: string) => {
     setStopTimes(prev => {
       const next = prev.map(r => ({ ...r }));
+
+      // Blank time: don't create rows; if exists, blank BOTH arrival & departure
+      if (!newTime || !newTime.trim()) {
+        for (const r of next) {
+          if (r.trip_id === trip_id && r.stop_id === stop_id) {
+            r.departure_time = "";
+            r.arrival_time = "";
+            return next;
+          }
+        }
+        return next;
+      }
+
+      // Non-empty time
       let found = false;
       for (const r of next) {
         if (r.trip_id === trip_id && r.stop_id === stop_id) {
@@ -1011,7 +1051,7 @@ export default function App() {
     });
   };
 
-  /** Delete an entire stop row from selected pattern block (remove stop_times for given trips at that stop) */
+  /** Delete an entire stop row from selected pattern block */
   const handleDeleteStopRow = (stop_id: string, affectedTripIds: string[]) => {
     if (!confirm(`Remove stop ${stop_id} from ${affectedTripIds.length} trip(s)?`)) return;
     setStopTimes(prev => prev.filter(st => !(st.stop_id === stop_id && affectedTripIds.includes(st.trip_id))));
@@ -1048,7 +1088,22 @@ export default function App() {
   return (
     <div className="container" style={{ padding: 16 }}>
       <style>{`
-        .leaflet-container .leaflet-interactive { cursor: pointer; } /* hand on hover for markers/polylines */
+        /* grayscale tiles only when a route is selected */
+        .map-shell.bw .leaflet-tile { filter: grayscale(1) contrast(1.05) brightness(1.0); }
+
+        /* robust pulsating halo */
+        .route-halo-pulse {
+          animation: haloPulse 1.8s ease-in-out infinite !important;
+          filter: drop-shadow(0 0 4px rgba(255,255,255,0.9));
+          stroke: #ffffff !important;
+          stroke-linecap: round !important;
+        }
+
+        @keyframes haloPulse {
+          0%   { stroke-opacity: 0.65 !important; stroke-width: 10px !important; }
+          50%  { stroke-opacity: 0.20 !important; stroke-width: 16px !important; }
+          100% { stroke-opacity: 0.65 !important; stroke-width: 10px !important; }
+        }
       `}</style>
 
       <h1>GTFS Builder · V1 + Editor · Excel-like patterns</h1>
@@ -1125,48 +1180,76 @@ export default function App() {
       {/* Map */}
       <div className="card section">
         <div className="card-body">
-          <div className={`map-shell ${drawMode ? "is-drawing" : ""}`} style={{ height: 520, width: "100%", borderRadius: 12, overflow: "hidden", position: "relative" }}>
+          <div className={`map-shell ${selectedRouteId ? "bw" : ""} ${drawMode ? "is-drawing" : ""}`} style={{ height: 520, width: "100%", borderRadius: 12, overflow: "hidden", position: "relative" }}>
             <MapContainer center={[40.4168, -3.7038]} zoom={6} style={{ height: "100%", width: "100%" }}>
-              <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="© OpenStreetMap contributors" />
+            <TileLayer
+              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              attribution="© OpenStreetMap contributors"
+            />
 
-              {!drawMode && <AddStopOnClick onAdd={addStopFromMap} onTooFar={() => setBanner({ kind: "info", text: `Zoom in to at least ${MIN_ADD_ZOOM} to add stops.` })} />}
-              {drawMode && <DrawShapeOnClick onPoint={() => { /* draw mode click points */ }} onFinish={() => setDrawMode(false)} />}
+            {/* Declare panes ONCE */}
+            <Pane name="routeHalo" style={{ zIndex: 390 }} />
+            <Pane name="routeLines" style={{ zIndex: 400 }} />
+            <Pane name="stopsTop"  style={{ zIndex: 650 }} />
 
-              {/* tiny circular markers + select on click */}
-              {stops.map(s => (
-                <CircleMarker
-                  key={s.uid}
-                  center={[s.stop_lat, s.stop_lon]}
-                  radius={3}
-                  color={selectedStopId === s.stop_id ? "#e11d48" : "#222"}
-                  weight={selectedStopId === s.stop_id ? 2 : 1}
-                  fillColor="#fff"
-                  fillOpacity={1}
-                  eventHandlers={{
-                    click: () => setSelectedStopId(s.stop_id),
-                  }}
-                />
-              ))}
+            {!drawMode && (
+              <AddStopOnClick
+                onAdd={addStopFromMap}
+                onTooFar={() => setBanner({ kind: "info", text: `Zoom in to at least ${MIN_ADD_ZOOM} to add stops.` })}
+              />
+            )}
+            {drawMode && <DrawShapeOnClick onPoint={() => {}} onFinish={() => setDrawMode(false)} />}
 
-              {/* polylines — keep all, highlight selected; click selects route */}
-              {Array.from(routePolylines.entries()).map(([route_id, coords]) => (
-                <Polyline
-                  key={route_id}
-                  positions={coords as any}
-                  pathOptions={{
-                    color: routeColor(route_id),
-                    weight: selectedRouteId === route_id ? 6 : 3,
-                    opacity: selectedRouteId && selectedRouteId !== route_id ? 0.35 : 0.9
-                  }}
-                  eventHandlers={{ click: () => setSelectedRouteId(route_id) }}
-                />
-              ))}
-            </MapContainer>
+            {/* STOPS — render directly, just set pane="stopsTop" */}
+            {stops.map(s => (
+              <CircleMarker
+                key={s.uid}
+                center={[s.stop_lat, s.stop_lon]}
+                pane="stopsTop"
+                radius={selectedRouteId ? 3.5 : 3}
+                color={selectedStopId === s.stop_id ? "#e11d48" : "#111"}
+                weight={1.5}
+                fillColor="#fff"
+                fillOpacity={1}
+                eventHandlers={{ click: () => setSelectedStopId(s.stop_id) }}
+              />
+            ))}
+
+            {/* ROUTES — lines in routeLines; halo in routeHalo */}
+            {Array.from(routePolylines.entries()).map(([route_id, coords]) => {
+              const isSel = selectedRouteId === route_id;
+              const hasSel = !!selectedRouteId;
+
+              const color   = hasSel ? (isSel ? routeColor(route_id) : DIM_ROUTE_COLOR) : routeColor(route_id);
+              const weight  = isSel ? 6 : 3;
+              const opacity = hasSel ? (isSel ? 0.95 : 0.6) : 0.95;
+
+              return (
+                <div key={route_id}>
+                  {isSel && (
+                    <Polyline
+                      positions={coords as any}
+                      pane="routeHalo"
+                      className="route-halo-pulse"                 // <-- add this
+                      pathOptions={{ color: "#ffffff", weight: 10, opacity: 0.9, lineCap: "round" }}
+                      eventHandlers={{ click: () => setSelectedRouteId(route_id) }}
+                    />
+                  )}
+                  <Polyline
+                    positions={coords as any}
+                    pane="routeLines"
+                    pathOptions={{ color, weight, opacity }}
+                    eventHandlers={{ click: () => setSelectedRouteId(route_id) }}
+                  />
+                </div>
+              );
+            })}
+          </MapContainer>
           </div>
         </div>
       </div>
 
-      {/* routes.txt — selected route appears FIRST; full-row click selects; ✓ deselects */}
+      {/* routes.txt — selected route appears FIRST; click any field selects; ✓ deselects */}
       <PaginatedEditableTable
         title="routes.txt"
         rows={routes}
@@ -1178,6 +1261,7 @@ export default function App() {
         selectedIcon="✓"
         clearSignal={clearSignal}
         onIconClick={() => setSelectedRouteId(null)}
+        selectOnCellFocus // <— clicking/focusing any cell selects that route
       />
 
       {/* Service chips */}
@@ -1240,6 +1324,55 @@ export default function App() {
         </div>
       )}
 
+      {/* ---------- OTHER GTFS TABLES (editable) ---------- */}
+      <div style={{ marginTop: 12 }}>
+        <PaginatedEditableTable
+          title="agency.txt"
+          rows={agencies}
+          onChange={setAgencies}
+          initialPageSize={5}
+        />
+        <PaginatedEditableTable
+          title="stops.txt"
+          rows={stops.map(s => ({ stop_id: s.stop_id, stop_name: s.stop_name, stop_lat: s.stop_lat, stop_lon: s.stop_lon }))}
+          onChange={(next) => {
+            // merge back into stops (keep uid)
+            const uidById = new Map(stops.map(s => [s.stop_id, s.uid]));
+            setStops(next.map((r: any) => ({
+              uid: uidById.get(r.stop_id) || uuidv4(),
+              stop_id: r.stop_id, stop_name: r.stop_name, stop_lat: Number(r.stop_lat), stop_lon: Number(r.stop_lon)
+            })));
+          }}
+          initialPageSize={5}
+        />
+        <PaginatedEditableTable
+          title="calendar.txt"
+          rows={services}
+          onChange={setServices}
+          initialPageSize={5}
+        />
+        <PaginatedEditableTable
+          title="trips.txt"
+          rows={trips}
+          onChange={setTrips}
+          initialPageSize={10}
+        />
+        <PaginatedEditableTable
+          title="stop_times.txt"
+          rows={stopTimes}
+          onChange={setStopTimes}
+          initialPageSize={10}
+        />
+        <PaginatedEditableTable
+          title="shapes.txt"
+          rows={shapePts.map(s => ({ shape_id: s.shape_id, shape_pt_lat: s.lat, shape_pt_lon: s.lon, shape_pt_sequence: s.seq }))}
+          onChange={(next) => {
+            setShapePts(next.map((r: any) => ({ shape_id: r.shape_id, lat: Number(r.shape_pt_lat), lon: Number(r.shape_pt_lon), seq: Number(r.shape_pt_sequence) })));
+          }}
+          initialPageSize={10}
+        />
+      </div>
+
       {/* Validation summary */}
       <div className="card section" style={{ marginTop: 12 }}>
         <div className="card-body">
@@ -1261,7 +1394,7 @@ export default function App() {
             </>
           )}
           <p className="muted" style={{ marginTop: 8 }}>
-            Export skips stop_time rows with both times empty.
+            Export skips any <code>stop_times</code> row where both arrival and departure are blank.
           </p>
         </div>
       </div>
