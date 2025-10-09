@@ -1,10 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState,useCallback } from "react";
 import { MapContainer, TileLayer, Polyline, CircleMarker, useMapEvents, useMap, Pane } from "react-leaflet";
 import L from "leaflet";
 import JSZip from "jszip";
 import { saveAs } from "file-saver";
 import * as Papa from "papaparse";
 import { v4 as uuidv4 } from "uuid";
+import PatternMatrix from "./PatternMatrix";
+
+
+
 
 /** ---------- Misc ---------- */
 const defaultTZ: string = String(Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Madrid");
@@ -19,8 +23,24 @@ type Service = {
   monday: number; tuesday: number; wednesday: number; thursday: number; friday: number; saturday: number; sunday: number;
   start_date: string; end_date: string;
 };
-type Trip = { route_id: string; service_id: string; trip_id: string; trip_headsign?: string; shape_id?: string; direction_id?: string };
-type StopTime = { trip_id: string; arrival_time: string; departure_time: string; stop_id: string; stop_sequence: number | string };
+type Trip = {
+  route_id: string;
+  service_id: string;
+  trip_id: string;
+  trip_headsign?: string;
+  shape_id?: string;
+  direction_id?: number;      // ← number (not string)
+};
+
+type StopTime = {
+  trip_id: string;
+  arrival_time: string;
+  departure_time: string;
+  stop_id: string;
+  stop_sequence: number;      // ← number only
+  pickup_type?: number;
+  drop_off_type?: number;
+};
 type ShapePt = { shape_id: string; lat: number; lon: number; seq: number };
 type Agency = { agency_id: string; agency_name: string; agency_url: string; agency_timezone: string };
 
@@ -76,6 +96,13 @@ function gtfsFromUi(t: string | undefined): string {
   const mm = m[2];
   return `${hh}:${mm}:00`;
 }
+// Export helper: HH:MM -> HH:MM:SS
+function toHHMMSS(s?: string | null) {
+  if (!s) return "";
+  const m = String(s).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return s;
+  return `${m[1].padStart(2, "0")}:${m[2]}:${(m[3] ?? "00").padStart(2, "0")}`;
+}
 
 /** ---------- Export GTFS (zip) ---------- */
 async function exportGTFSZip(payload: {
@@ -84,7 +111,6 @@ async function exportGTFSZip(payload: {
 }) {
   const zip = new JSZip();
 
-  // Skip any stop_times rows where both times are blank
   const filteredStopTimes = payload.stopTimes.filter(
     st => !!(st.arrival_time?.trim() || st.departure_time?.trim())
   );
@@ -156,16 +182,31 @@ function cmp(op: string, left: any, right: any): boolean {
   const ln = tryNumber(lstr);
   const rn = tryNumber(rstr);
   const bothNums = ln !== null && rn !== null;
-  switch (op) {
-    case "==": return bothNums ? ln === rn : lstr === rstr;
-    case "!=": return bothNums ? ln !== rn : lstr !== rstr;
-    case ">":  return bothNums ? ln > rn : lstr > rstr;
-    case "<":  return bothNums ? ln < rn : lstr < rstr;
-    case ">=": return bothNums ? ln >= rn : lstr >= rstr;
-    case "<=": return bothNums ? ln <= rn : lstr <= rstr;
-    case "~=": return lstr.toLowerCase().includes(rstr.toLowerCase());
-    case "!~=": return !lstr.toLowerCase().includes(rstr.toLowerCase());
-    default: return false;
+
+  if (bothNums) {
+    switch (op) {
+      case "==": return ln === rn;
+      case "!=": return ln !== rn;
+      case ">":  return ln > rn;
+      case "<":  return ln < rn;
+      case ">=": return ln >= rn;
+      case "<=": return ln <= rn;
+      case "~=": return String(lstr).toLowerCase().includes(String(rstr).toLowerCase());
+      case "!~=": return !String(lstr).toLowerCase().includes(String(rstr).toLowerCase());
+      default: return false;
+    }
+  } else {
+    switch (op) {
+      case "==": return lstr === rstr;
+      case "!=": return lstr !== rstr;
+      case ">":  return lstr >  rstr;
+      case "<":  return lstr <  rstr;
+      case ">=": return lstr >= rstr;
+      case "<=": return lstr <= rstr;
+      case "~=": return lstr.toLowerCase().includes(rstr.toLowerCase());
+      case "!~=": return !lstr.toLowerCase().includes(rstr.toLowerCase());
+      default: return false;
+    }
   }
 }
 function matchesAdvancedRow(row: Record<string, any>, expr: string): boolean {
@@ -183,29 +224,33 @@ function matchesAdvancedRow(row: Record<string, any>, expr: string): boolean {
   return false;
 }
 
-/** ---------- Generic table ---------- */
+/** ---------- Generic table with delete & multi-select ---------- */
 function PaginatedEditableTable<T extends Record<string, any>>({
   title, rows, onChange,
   visibleIndex,
   initialPageSize = 5,
-  onRowClick,
+  onRowClick,                   // (row, event) => void
   selectedPredicate,
   selectedIcon = "✓",
   clearSignal = 0,
   onIconClick,
-  selectOnCellFocus = false, // NEW: focusing a cell selects the row
+  selectOnCellFocus = false,
+  onDeleteRow,                  // NEW: show a rightmost (×) per row
+  enableMultiSelect = false,    // NEW: allow Cmd/Ctrl additive selection
 }: {
   title: string;
   rows: T[];
   onChange: (next: T[]) => void;
   visibleIndex?: number[];
   initialPageSize?: 5|10|20|50|100;
-  onRowClick?: (row: T) => void;
+  onRowClick?: (row: T, e: React.MouseEvent) => void;
   selectedPredicate?: (row: T) => boolean;
   selectedIcon?: string;
   clearSignal?: number;
   onIconClick?: (row: T) => void;
   selectOnCellFocus?: boolean;
+  onDeleteRow?: (row: T) => void;
+  enableMultiSelect?: boolean;
 }) {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<5|10|20|50|100>(initialPageSize);
@@ -292,6 +337,7 @@ function PaginatedEditableTable<T extends Record<string, any>>({
               <tr>
                 {!!selectedPredicate && <th style={{ width: 28 }}></th>}
                 {cols.map(c => <th key={c} style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>{c}</th>)}
+                {!!onDeleteRow && <th style={{ width: 30 }}></th>}
               </tr>
             </thead>
             <tbody>
@@ -301,7 +347,7 @@ function PaginatedEditableTable<T extends Record<string, any>>({
                 return (
                   <tr
                     key={gi}
-                    onClick={onRowClick ? () => onRowClick(r) : undefined}
+                    onClick={(e) => onRowClick ? onRowClick(r, e) : undefined}
                     style={{
                       cursor: onRowClick ? "pointer" : "default",
                       background: isSelected ? "rgba(232, 242, 255, 0.7)" : "transparent",
@@ -326,17 +372,25 @@ function PaginatedEditableTable<T extends Record<string, any>>({
                       <td key={c} style={{ borderBottom: "1px solid #f3f3f3", padding: 4 }}>
                         <input
                           value={(r as any)[c] ?? ""}
-                          onFocus={selectOnCellFocus && onRowClick ? () => onRowClick(r) : undefined}
+                          onFocus={selectOnCellFocus && onRowClick ? (e) => onRowClick(r, e as any) : undefined}
                           onChange={e => edit(gi, c, e.target.value)}
-                          // keep click propagation so full-row select still works when you click into inputs
                           style={{ width: "100%", outline: "none", border: "1px solid #e8e8e8", padding: "4px 6px", borderRadius: 8, background: "white" }}
                         />
                       </td>
                     ))}
+                    {!!onDeleteRow && (
+                      <td style={{ borderBottom: "1px solid #f3f3f3", padding: 0, textAlign: "center" }}>
+                        <button
+                          title="Delete row"
+                          onClick={(e) => { e.stopPropagation(); onDeleteRow(r); }}
+                          style={{ border:"none", background:"transparent", cursor:"pointer", width: 28, height: 28, lineHeight: "28px" }}
+                        >×</button>
+                      </td>
+                    )}
                   </tr>
                 );
               }) : (
-                <tr><td colSpan={(selectedPredicate ? 1 : 0) + Math.max(1, cols.length)} style={{ padding: 12, opacity: .6 }}>No rows.</td></tr>
+                <tr><td colSpan={(selectedPredicate ? 1 : 0) + Math.max(1, cols.length) + (onDeleteRow ? 1 : 0)} style={{ padding: 12, opacity: .6 }}>No rows.</td></tr>
               )}
             </tbody>
           </table>
@@ -407,291 +461,17 @@ function ServiceChip({
   );
 }
 
-/** ---------- PATTERN VIEW (Excel-like) ---------- */
-function PatternMatrix({
-  route,
-  trips,
-  stops,
-  stopTimes,
-  services,
-  activeServiceIds,
-  onEditTime,
-  onDeleteStopRow,
-}: {
-  route: RouteRow;
-  trips: Trip[];
-  stops: Stop[];
-  stopTimes: StopTime[];
-  services: Service[];
-  activeServiceIds: Set<string>;
-  onEditTime: (trip_id: string, stop_id: string, newTime: string) => void;
-  onDeleteStopRow: (stop_id: string, affectedTripIds: string[]) => void;
-}) {
-  const stopName = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const s of stops) m.set(s.stop_id, s.stop_name);
-    return m;
-  }, [stops]);
-
-  const serviceById = useMemo(() => {
-    const m = new Map<string, Service>();
-    for (const s of services) m.set(s.service_id, s);
-    return m;
-  }, [services]);
-
-  function daysString(svc?: Service) {
-    if (!svc) return "";
-    const flags = [svc.monday,svc.tuesday,svc.wednesday,svc.thursday,svc.friday,svc.saturday,svc.sunday];
-    const chars = ["M","T","W","T","F","S","S"];
-    return chars.map((c,i)=> flags[i] ? c : "·").join("");
-  }
-
-  function ymdDashed(yyyymmdd?: string) {
-    if (!yyyymmdd || yyyymmdd.length !== 8) return "";
-    return `${yyyymmdd.slice(0,4)}-${yyyymmdd.slice(4,6)}-${yyyymmdd.slice(6,8)}`;
-  }
-
-  const stByTrip = useMemo(() => {
-    const m = new Map<string, StopTime[]>();
-    for (const st of stopTimes) {
-      const arr = m.get(st.trip_id) ?? [];
-      arr.push(st);
-      m.set(st.trip_id, arr);
-    }
-    for (const [k, arr] of m) {
-      arr.sort((a, b) => num(a.stop_sequence) - num(b.stop_sequence));
-      m.set(k, arr);
-    }
-    return m;
-  }, [stopTimes]);
-
-  const seqByTrip = useMemo(() => {
-    const m = new Map<string, string[]>();
-    for (const t of trips) {
-      const seq: string[] = [];
-      const seen = new Set<string>();
-      const arr = stByTrip.get(t.trip_id) ?? [];
-      for (const r of arr) {
-        const sid = r.stop_id;
-        if (!seen.has(sid)) { seen.add(sid); seq.push(sid); }
-      }
-      m.set(t.trip_id, seq);
-    }
-    return m;
-  }, [trips, stByTrip]);
-
-  const reps = useMemo(() => {
-    const uniq: string[][] = [];
-    for (const t of trips) {
-      const s = seqByTrip.get(t.trip_id) ?? [];
-      if (!uniq.some(u => u.length === s.length && u.every((x, i) => x === s[i]))) uniq.push(s);
-    }
-    const out: string[][] = [];
-    for (const s of uniq) {
-      let sub = false;
-      for (const t of uniq) { if (s === t) continue; if (isSubsequence(s, t)) { sub = true; break; } }
-    if (!sub) out.push(s);
-    }
-    return out.length ? out : uniq;
-  }, [trips, seqByTrip]);
-
-  const depMapByTrip = useMemo(() => {
-    const m = new Map<string, Map<string, string>>();
-    for (const t of trips) {
-      const inner = new Map<string, string>();
-      const rows = stByTrip.get(t.trip_id) ?? [];
-      for (const r of rows) {
-        const time = (r.departure_time && String(r.departure_time)) || (r.arrival_time && String(r.arrival_time)) || "";
-        inner.set(r.stop_id, time);
-      }
-      m.set(t.trip_id, inner);
-    }
-    return m;
-  }, [trips, stByTrip]);
-
-  const headerFor = (t: Trip) => {
-  const svc = serviceById.get(t.service_id);
-  const days = daysString(svc);
-  const range = svc ? `${ymdDashed(svc.start_date)}/${ymdDashed(svc.end_date)}` : "";
-  return (
-    <div style={{lineHeight:1.15, whiteSpace:"normal"}}>
-      <div style={{fontWeight:700}}>{t.trip_id}</div>
-      <div>{t.service_id}</div>
-      <div style={{opacity:.7}}>
-        {days || range ? `(${[days, range].filter(Boolean).join(" ")})` : ""}
-      </div>
-    </div>
-  );
-};
-
-  const PatternBlock = ({ idx, seq, groupTrips }: { idx: number; seq: string[]; groupTrips: Trip[] }) => {
-    const [isEditing, setIsEditing] = useState(false);
-    const [colOrder, setColOrder] = useState<string[] | null>(null);
-
-    if (!seq.length || !groupTrips.length) return null;
-    const first = seq[0];
-
-    const filteredTrips = useMemo(
-      () => groupTrips.filter(t => activeServiceIds.size ? activeServiceIds.has(t.service_id) : true),
-      [groupTrips, activeServiceIds]
-    );
-
-    const baseSortedIds = useMemo(() => {
-      const firstTimes = new Map<string, string>(); // trip_id -> HH:MM:SS or ""
-      for (const t of filteredTrips) {
-        const tm = depMapByTrip.get(t.trip_id)?.get(first) ?? "";
-        firstTimes.set(t.trip_id, tm);
-      }
-      const ids = filteredTrips.map(t => t.trip_id);
-      ids.sort((a, b) => {
-        const ta = filteredTrips.find(t => t.trip_id === a)!;
-        const tb = filteredTrips.find(t => t.trip_id === b)!;
-
-        // 1) by service_id (string compare)
-        if (ta.service_id !== tb.service_id) return ta.service_id.localeCompare(tb.service_id);
-
-        // 2) by first departure time (empty times last)
-        const fa = firstTimes.get(a) ?? "";
-        const fb = firstTimes.get(b) ?? "";
-        if (fa === "" && fb === "") return a.localeCompare(b);
-        if (fa === "") return 1;
-        if (fb === "") return -1;
-        if (fa !== fb) return fa.localeCompare(fb);
-
-        // 3) tie-breaker by trip_id
-        return a.localeCompare(b);
-      });
-      return ids;
-    }, [filteredTrips, depMapByTrip, first]);
-
-    useEffect(() => { if (!isEditing) setColOrder(baseSortedIds); }, [isEditing, baseSortedIds]);
-
-    let orderedTrips = useMemo(() => {
-      const order = colOrder ?? [];
-      const idxMap = new Map(order.map((id, i) => [id, i]));
-      return filteredTrips.slice().sort((ta, tb) => (idxMap.get(ta.trip_id)! - idxMap.get(tb.trip_id)!));
-    }, [filteredTrips, colOrder]);
-
-    if (!isEditing) {
-      orderedTrips = orderedTrips.filter(t => {
-        const times = seq.map(sid => depMapByTrip.get(t.trip_id)?.get(sid));
-        return isMonotonicNonDecreasing(times);
-      });
-      if (!orderedTrips.length) return null;
-    }
-
-    const TimeCell = ({ tripId, stopId }: { tripId: string; stopId: string }) => {
-      const source = depMapByTrip.get(tripId)?.get(stopId) ?? "";
-      const [draft, setDraft] = useState(uiFromGtfs(source));
-      useEffect(() => { setDraft(uiFromGtfs(source)); }, [source]);
-
-      const commit = () => {
-        const gtfs = gtfsFromUi(draft); // "" allowed
-        onEditTime(tripId, stopId, gtfs);
-      };
-
-      return (
-        <input
-          value={draft}
-          onFocus={() => setIsEditing(true)}
-          onBlur={() => { setIsEditing(false); commit(); }}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") { (e.target as HTMLInputElement).blur(); } }}
-          placeholder="HH:MM"
-          style={{ width: 90, border: "1px solid #e8e8e8", padding: "3px 6px", borderRadius: 8 }}
-        />
-      );
-    };
-
-    const DeleteRowBtn = ({ stopId }: { stopId: string }) => (
-      <button
-        title="Delete stop from these trips"
-        onClick={() => onDeleteStopRow(stopId, orderedTrips.map(t => t.trip_id))}
-        style={{ border: "none", background: "transparent", cursor: "pointer", marginRight: 6 }}
-      >🗑</button>
-    );
-
-    return (
-      <div className="card section" style={{ marginTop: 10, borderColor: "#e9eef3" }}>
-        <div className="card-body">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
-            <h3 style={{ margin: 0 }}>
-              Pattern p{idx} · {stopName.get(seq[0]) ?? seq[0]} → {stopName.get(seq[seq.length - 1]) ?? seq[seq.length - 1]}
-              <span style={{ marginLeft: 8, fontSize: 12, opacity: .6 }}>({seq.length} stops · {orderedTrips.length} trips)</span>
-            </h3>
-          </div>
-
-          <div className="overflow-auto" style={{ borderRadius: 12, border: "1px solid #eee", marginTop: 8 }}>
-            <table style={{ width: "100%", fontSize: 13, minWidth: 940 }}>
-              <thead>
-                <tr>
-                  <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee", width: 32 }}></th>
-                  <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee", width: 180 }}>stop_id</th>
-                  <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee", width: 260 }}>stop_name</th>
-                  {orderedTrips.map(t => (
-                    <th key={t.trip_id} style={{ textAlign:"left", padding:8, borderBottom:"1px solid #eee", minWidth:150 }}>
-                      {headerFor(t)}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {seq.map((sid) => (
-                  <tr key={sid}>
-                    <td style={{ borderBottom: "1px solid #f3f3f3", padding: 6, textAlign: "center" }}>
-                      <DeleteRowBtn stopId={sid} />
-                    </td>
-                    <td style={{ borderBottom: "1px solid #f3f3f3", padding: 6 }}><code>{sid}</code></td>
-                    <td style={{ borderBottom: "1px solid #f3f3f3", padding: 6 }}>{stopName.get(sid) ?? ""}</td>
-                    {orderedTrips.map(t => (
-                      <td key={t.trip_id} style={{ borderBottom: "1px solid #f3f3f3", padding: 6, whiteSpace: "nowrap" }}>
-                        <TimeCell tripId={t.trip_id} stopId={sid} />
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-        </div>
-      </div>
-    );
-  };
-
-  const blocks = [];
-  let pIndex = 1;
-  for (let i = 0; i < reps.length; i++) {
-    const seq = reps[i];
-    const groupTrips = trips.filter(t => {
-      const s = seqByTrip.get(t.trip_id) ?? [];
-      return isSubsequence(s, seq);
-    });
-    if (!groupTrips.length || !seq.length) continue;
-    blocks.push(<PatternBlock key={`p${i}`} idx={pIndex++} seq={seq} groupTrips={groupTrips} />);
-  }
-
-  if (!blocks.length) return (
-    <div className="card section" style={{ marginTop: 12 }}>
-      <div className="card-body">
-        <h3 style={{ margin: 0 }}>Patterns</h3>
-        <p style={{ opacity: .7, marginTop: 6 }}>No trips/stop_times available for this route (or all trips filtered / non-monotonic).</p>
-      </div>
-    </div>
-  );
-
-  return (
-    <div className="card section" style={{ marginTop: 12 }}>
-      <div className="card-body">
-        <h2 style={{ marginTop: 0 }}>Excel-like Patterns for route <code>{route.route_id}</code></h2>
-        {blocks}
-      </div>
-    </div>
-  );
-}
-
 /** ---------- App ---------- */
 export default function App() {
+  const [project, setProject] = useState<any>({ extras: { restrictions: {} } });
+
+  const handleRestrictionsChange = useCallback((map: Record<string, any>) => {
+    setProject((prev: any) => ({
+      ...(prev ?? {}),
+      extras: { ...(prev?.extras ?? {}), restrictions: map },
+    }));
+  }, []);
+
   /** Leaflet icons */
   useEffect(() => {
     // @ts-ignore
@@ -727,6 +507,7 @@ export default function App() {
   const [nextStopName, setNextStopName] = useState<string>("");
   const [showRoutes, setShowRoutes] = useState<boolean>(true);
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
+  const [selectedRouteIds, setSelectedRouteIds] = useState<Set<string>>(new Set()); // NEW multi-select
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
 
   /** Filters / clearing */
@@ -842,17 +623,24 @@ export default function App() {
       }
       if (tables["trips"]) {
         setTrips(parse(tables["trips"]).map((r: any) => ({
-          route_id: String(r.route_id ?? ""), service_id: String(r.service_id ?? ""), trip_id: String(r.trip_id ?? ""),
+          route_id: String(r.route_id ?? ""),
+          service_id: String(r.service_id ?? ""),
+          trip_id: String(r.trip_id ?? ""),
           trip_headsign: r.trip_headsign != null ? String(r.trip_headsign) : undefined,
           shape_id: r.shape_id != null ? String(r.shape_id) : undefined,
-          direction_id: r.direction_id != null ? String(r.direction_id) : undefined,
+          direction_id: r.direction_id != null && r.direction_id !== "" ? Number(r.direction_id) : undefined, // ← force number
         })));
       }
+
       if (tables["stop_times"]) {
         setStopTimes(parse(tables["stop_times"]).map((r: any) => ({
-          trip_id: String(r.trip_id ?? ""), arrival_time: String(r.arrival_time ?? ""),
-          departure_time: String(r.departure_time ?? ""), stop_id: String(r.stop_id ?? ""),
-          stop_sequence: r.stop_sequence ?? 0,
+          trip_id: String(r.trip_id ?? ""),
+          arrival_time: String(r.arrival_time ?? ""),
+          departure_time: String(r.departure_time ?? ""),
+          stop_id: String(r.stop_id ?? ""),
+          stop_sequence: Number(r.stop_sequence ?? 0),  // ← force number
+          pickup_type: r.pickup_type != null && r.pickup_type !== "" ? Number(r.pickup_type) : undefined,
+          drop_off_type: r.drop_off_type != null && r.drop_off_type !== "" ? Number(r.drop_off_type) : undefined,
         })));
       }
       if (tables["shapes"]) {
@@ -947,6 +735,7 @@ export default function App() {
   }, [routes, tripsByRoute, shapesById, stopTimesByTrip, stopsById]);
 
   /** ---------- Selection & ordering ---------- */
+  // Visual: selected route first
   const routesVisibleIdx = useMemo(() => {
     const idxs = routes.map((_, i) => i);
     if (!selectedRouteId) return idxs;
@@ -956,7 +745,7 @@ export default function App() {
   }, [routes, selectedRouteId]);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") { setSelectedRouteId(null); setSelectedStopId(null); } };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") { setSelectedRouteId(null); setSelectedStopId(null); setSelectedRouteIds(new Set()); } };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
@@ -1010,6 +799,7 @@ export default function App() {
     setAgencies([]); setStops([]); setRoutes([]); setServices([]); setTrips([]); setStopTimes([]); setShapePts([]);
     localStorage.removeItem(STORAGE_KEY);
     setSelectedRouteId(null);
+    setSelectedRouteIds(new Set());
     setSelectedStopId(null);
     setActiveServiceIds(new Set());
     setClearSignal(x => x + 1);
@@ -1020,7 +810,6 @@ export default function App() {
     setStopTimes(prev => {
       const next = prev.map(r => ({ ...r }));
 
-      // Blank time: don't create rows; if exists, blank BOTH arrival & departure
       if (!newTime || !newTime.trim()) {
         for (const r of next) {
           if (r.trip_id === trip_id && r.stop_id === stop_id) {
@@ -1032,7 +821,6 @@ export default function App() {
         return next;
       }
 
-      // Non-empty time
       let found = false;
       for (const r of next) {
         if (r.trip_id === trip_id && r.stop_id === stop_id) {
@@ -1045,24 +833,21 @@ export default function App() {
       if (!found) {
         const seqs = next.filter(r => r.trip_id === trip_id).map(r => num(r.stop_sequence, 0));
         const newSeq = (seqs.length ? Math.max(...seqs) : 0) + 1;
-        next.push({ trip_id, stop_id, departure_time: newTime, arrival_time: newTime, stop_sequence: newSeq });
+        next.push({
+          trip_id,
+          stop_id,
+          departure_time: newTime,
+          arrival_time: newTime,
+          stop_sequence: Number(newSeq),   // ← force number
+        });
       }
       return next;
     });
   };
 
-  /** Delete an entire stop row from selected pattern block */
-  const handleDeleteStopRow = (stop_id: string, affectedTripIds: string[]) => {
-    if (!confirm(`Remove stop ${stop_id} from ${affectedTripIds.length} trip(s)?`)) return;
-    setStopTimes(prev => prev.filter(st => !(st.stop_id === stop_id && affectedTripIds.includes(st.trip_id))));
-  };
-
-  /** Delete selected route (and its trips/stop_times/shapes) */
-  const deleteSelectedRoute = () => {
-    if (!selectedRouteId) return;
-    if (!confirm(`Delete route ${selectedRouteId}? This removes its trips, stop_times, and shapes.`)) return;
-    const rid = selectedRouteId;
-    const remainingTrips = trips.filter(t => t.route_id !== rid);
+  /** Delete a route and its dependent data */
+  const hardDeleteRoute = (route_id: string) => {
+    const remainingTrips = trips.filter(t => t.route_id !== route_id);
     const remainingTripIds = new Set(remainingTrips.map(t => t.trip_id));
     setTrips(remainingTrips);
     setStopTimes(prev => prev.filter(st => remainingTripIds.has(st.trip_id)));
@@ -1070,8 +855,13 @@ export default function App() {
       const keptShapeIds = new Set(remainingTrips.map(t => t.shape_id).filter(Boolean) as string[]);
       return prev.filter(s => keptShapeIds.has(s.shape_id));
     });
-    setRoutes(prev => prev.filter(r => r.route_id !== rid));
-    setSelectedRouteId(null);
+    setRoutes(prev => prev.filter(r => r.route_id !== route_id));
+    setSelectedRouteIds(prev => {
+      const n = new Set(prev);
+      n.delete(route_id);
+      return n;
+    });
+    if (selectedRouteId === route_id) setSelectedRouteId(null);
   };
 
   /** Delete selected stop (from stops + all stop_times) */
@@ -1084,35 +874,194 @@ export default function App() {
     setSelectedStopId(null);
   };
 
+  /** ---------- OD compiler + compiled export ---------- */
+  function compileTripsWithOD(
+    restrictions: Record<
+      string,
+      { mode: "normal" | "pickup" | "dropoff" | "custom"; dropoffOnlyFrom?: string[]; pickupOnlyTo?: string[] }
+    >
+  ) {
+    const outTrips: Trip[] = [];
+    const outStopTimes: StopTime[] = [];
+
+    for (const t of trips) {
+      const rows = (stopTimesByTrip.get(t.trip_id) ?? []).slice();
+      if (!rows.length) continue;
+
+      const rulesByIdx = new Map<number, { mode: "normal" | "pickup" | "dropoff" | "custom"; dropoffOnlyFrom?: string[]; pickupOnlyTo?: string[] }>();
+      rows.forEach((st, i) => {
+        const key = `${t.trip_id}::${st.stop_id}`;
+        const r = (restrictions as any)[key];
+        if (r && r.mode) rulesByIdx.set(i, r);
+      });
+
+      const hasCustom = Array.from(rulesByIdx.values()).some(r => r.mode === "custom");
+
+      if (!hasCustom) {
+        outTrips.push({ ...t });
+        for (const st of rows) {
+          const r = rulesByIdx.get(rows.indexOf(st));
+          let pickup_type = 0, drop_off_type = 0;
+          if (r?.mode === "pickup")  drop_off_type = 1;
+          if (r?.mode === "dropoff") pickup_type  = 1;
+
+          const arr = toHHMMSS(st.arrival_time);
+          const dep = toHHMMSS(st.departure_time);
+          if (!arr && !dep) continue;
+
+          outStopTimes.push({
+            trip_id: t.trip_id,
+            stop_id: st.stop_id,
+            stop_sequence: 0,
+            arrival_time: arr,
+            departure_time: dep,
+            pickup_type,
+            drop_off_type,
+          });
+        }
+        continue;
+      }
+
+      // Two-segment compilation around custom stops
+      const customIdxs = rows.map((_, i) => i).filter(i => rulesByIdx.get(i)?.mode === "custom");
+      const firstC = Math.min(...customIdxs);
+      const lastC  = Math.max(...customIdxs);
+
+      const upId = `${t.trip_id}__segA`;
+      outTrips.push({ ...t, trip_id: upId });
+      for (let i = 0; i <= lastC; i++) {
+        const st = rows[i];
+        const r = rulesByIdx.get(i);
+        let pickup_type = 0, drop_off_type = 0;
+        if (r?.mode === "pickup")  drop_off_type = 1;
+        else if (r?.mode === "dropoff") pickup_type = 1;
+        else if (r?.mode === "custom") { pickup_type = 1; drop_off_type = 0; }
+        const arr = toHHMMSS(st.arrival_time);
+        const dep = toHHMMSS(st.departure_time);
+        if (!arr && !dep) continue;
+        outStopTimes.push({
+          trip_id: upId, stop_id: st.stop_id, stop_sequence: 0,
+          arrival_time: arr, departure_time: dep, pickup_type, drop_off_type
+        });
+      }
+
+      const downId = `${t.trip_id}__segB`;
+      outTrips.push({ ...t, trip_id: downId });
+      for (let i = firstC; i < rows.length; i++) {
+        const st = rows[i];
+        const r = rulesByIdx.get(i);
+        let pickup_type = 0, drop_off_type = 0;
+        if (r?.mode === "pickup")  drop_off_type = 1;
+        else if (r?.mode === "dropoff") pickup_type = 1;
+        else if (r?.mode === "custom") { pickup_type = 0; drop_off_type = 1; }
+        const arr = toHHMMSS(st.arrival_time);
+        const dep = toHHMMSS(st.departure_time);
+        if (!arr && !dep) continue;
+        outStopTimes.push({
+          trip_id: downId, stop_id: st.stop_id, stop_sequence: 0,
+          arrival_time: arr, departure_time: dep, pickup_type, drop_off_type
+        });
+      }
+    }
+
+    const grouped = new Map<string, StopTime[]>();
+    for (const st of outStopTimes) {
+      (grouped.get(st.trip_id) ?? grouped.set(st.trip_id, []).get(st.trip_id)!).push(st);
+    }
+    const finalStopTimes: StopTime[] = [];
+    for (const [, arr] of grouped) {
+      arr.forEach((st, i) => (st.stop_sequence = i + 1));
+      finalStopTimes.push(...arr);
+    }
+
+    return { trips: outTrips, stop_times: finalStopTimes };
+  }
+
+  async function exportGtfsCompiled() {
+    const zip = new JSZip();
+
+    const agenciesOut = agencies.length ? agencies : [{
+      agency_id: "agency_1",
+      agency_name: "Agency",
+      agency_url: "https://example.com",
+      agency_timezone: defaultTZ,
+    }];
+    zip.file("agency.txt", csvify(agenciesOut, ["agency_id","agency_name","agency_url","agency_timezone"]));
+
+    zip.file("stops.txt", csvify(
+      stops.map(s => ({ stop_id: s.stop_id, stop_name: s.stop_name, stop_lat: s.stop_lat, stop_lon: s.stop_lon })),
+      ["stop_id","stop_name","stop_lat","stop_lon"]
+    ));
+
+    zip.file("routes.txt", csvify(
+      routes.map(r => ({
+        route_id: r.route_id,
+        route_short_name: r.route_short_name,
+        route_long_name: r.route_long_name,
+        route_type: r.route_type,
+        agency_id: r.agency_id || agenciesOut[0].agency_id,
+      })),
+      ["route_id","route_short_name","route_long_name","route_type","agency_id"]
+    ));
+
+    zip.file("calendar.txt", csvify(
+      services,
+      ["service_id","monday","tuesday","wednesday","thursday","friday","saturday","sunday","start_date","end_date"]
+    ));
+
+    if (shapePts.length) {
+      zip.file("shapes.txt", csvify(
+        shapePts.map(p => ({ shape_id: p.shape_id, shape_pt_lat: p.lat, shape_pt_lon: p.lon, shape_pt_sequence: p.seq })),
+        ["shape_id","shape_pt_lat","shape_pt_lon","shape_pt_sequence"]
+      ));
+    }
+
+    const restrictions = (project?.extras?.restrictions ?? {}) as Record<string, any>;
+    const { trips: outTrips, stop_times: outStopTimes } = compileTripsWithOD(restrictions);
+
+    zip.file("trips.txt", csvify(
+      outTrips.map(tr => ({
+        route_id: tr.route_id,
+        service_id: tr.service_id,
+        trip_id: tr.trip_id,
+        trip_headsign: tr.trip_headsign ?? "",
+        shape_id: tr.shape_id ?? "",
+        direction_id: tr.direction_id ?? "",
+      })),
+      ["route_id","service_id","trip_id","trip_headsign","shape_id","direction_id"]
+    ));
+
+    zip.file("stop_times.txt", csvify(
+      outStopTimes.map(st => ({
+        trip_id: st.trip_id,
+        arrival_time: toHHMMSS(st.arrival_time),
+        departure_time: toHHMMSS(st.departure_time),
+        stop_id: st.stop_id,
+        stop_sequence: st.stop_sequence,
+        pickup_type: st.pickup_type ?? 0,
+        drop_off_type: st.drop_off_type ?? 0,
+      })),
+      ["trip_id","arrival_time","departure_time","stop_id","stop_sequence","pickup_type","drop_off_type"]
+    ));
+
+    const blob = await zip.generateAsync({ type: "blob" });
+    saveAs(blob, "gtfs_compiled.zip");
+  }
+
   /** ---------- Render ---------- */
   return (
     <div className="container" style={{ padding: 16 }}>
       <style>{`
-        /* grayscale tiles only when a route is selected */
         .map-shell.bw .leaflet-tile { filter: grayscale(1) contrast(1.05) brightness(1.0); }
-
-        /* robust pulsating halo */
-        .route-halo-pulse {
-          animation: haloPulse 1.8s ease-in-out infinite !important;
-          filter: drop-shadow(0 0 4px rgba(255,255,255,0.9));
-          stroke: #ffffff !important;
-          stroke-linecap: round !important;
-        }
-
-        @keyframes haloPulse {
-          0%   { stroke-opacity: 0.65 !important; stroke-width: 10px !important; }
-          50%  { stroke-opacity: 0.20 !important; stroke-width: 16px !important; }
-          100% { stroke-opacity: 0.65 !important; stroke-width: 10px !important; }
-        }
+        .route-halo-pulse { animation: haloPulse 1.8s ease-in-out infinite !important; filter: drop-shadow(0 0 4px rgba(255,255,255,0.9)); stroke: #ffffff !important; stroke-linecap: round !important; }
+        @keyframes haloPulse { 0%{stroke-opacity:.65;stroke-width:10px;} 50%{stroke-opacity:.2;stroke-width:16px;} 100%{stroke-opacity:.65;stroke-width:10px;} }
       `}</style>
 
-      <h1>GTFS Builder · V1 + Editor · Excel-like patterns</h1>
+      <h1 style={{ fontSize: '15px'}}>GTFS Builder by Álvaro Trabanco for Rome2Rio</h1>
 
       {banner && (
-        <div
-          className={`banner ${banner.kind === "error" ? "banner-error" : banner.kind === "success" ? "banner-success" : "banner-info"}`}
-          style={{ margin: "8px 0 12px", padding: "8px 12px", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" }}
-        >
+        <div className={`banner ${banner.kind === "error" ? "banner-error" : banner.kind === "success" ? "banner-success" : "banner-info"}`}
+             style={{ margin: "8px 0 12px", padding: "8px 12px", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" }}>
           {banner.text}
         </div>
       )}
@@ -1130,11 +1079,14 @@ export default function App() {
             Show routes
           </label>
 
-          {selectedRouteId && (
+          {selectedRouteIds.size > 0 && (
             <div style={{ display: "flex", alignItems: "center", gap: 8, background: "#f6f7f9", padding: "6px 10px", borderRadius: 10 }}>
-              Selected route: <b>{selectedRouteId}</b>
-              <button className="btn" onClick={() => setSelectedRouteId(null)} title="Deselect (Esc)">×</button>
-              <button className="btn btn-danger" onClick={deleteSelectedRoute} title="Delete this route">Delete route</button>
+              Selected: <b>{Array.from(selectedRouteIds).join(", ")}</b>
+              <button className="btn" onClick={() => { setSelectedRouteIds(new Set()); setSelectedRouteId(null); }} title="Clear selection">×</button>
+              <button className="btn btn-danger" onClick={() => {
+                if (!confirm(`Delete ${selectedRouteIds.size} route(s)?`)) return;
+                Array.from(selectedRouteIds).forEach(hardDeleteRoute);
+              }}>Delete selected</button>
             </div>
           )}
 
@@ -1142,11 +1094,11 @@ export default function App() {
             <div style={{ display: "flex", alignItems: "center", gap: 8, background: "#fff4f4", padding: "6px 10px", borderRadius: 10 }}>
               Selected stop: <b>{selectedStopId}</b>
               <button className="btn" onClick={() => setSelectedStopId(null)} title="Deselect stop">×</button>
-              <button className="btn btn-danger" onClick={deleteSelectedStop} title="Delete this stop">Delete stop</button>
+              <button className="btn btn-danger" onClick={deleteSelectedStop} title="Delete stop">Delete stop</button>
             </div>
           )}
 
-          <button className="btn" onClick={() => { setSelectedRouteId(null); setSelectedStopId(null); setActiveServiceIds(new Set()); setClearSignal(x => x + 1); }}>
+          <button className="btn" onClick={() => { setSelectedRouteId(null); setSelectedRouteIds(new Set()); setSelectedStopId(null); setActiveServiceIds(new Set()); setClearSignal(x => x + 1); }}>
             Clear filters & selection
           </button>
 
@@ -1165,8 +1117,10 @@ export default function App() {
           </label>
 
           <button className="btn btn-primary" onClick={onExportGTFS}>Export GTFS .zip</button>
+          <button className="btn" onClick={exportGtfsCompiled}>Export GTFS (compile OD)</button>
+
           <button className="btn" onClick={() => {
-            const res = validateFeed({ agencies, stops, routes, services, trips, stopTimes, shapePts });
+            const res = runValidation();
             setValidation(res);
             setBanner(res.errors.length ? { kind: "error", text: `Validation found ${res.errors.length} errors and ${res.warnings.length} warnings.` }
                                         : { kind: "success", text: res.warnings.length ? `Validation OK with ${res.warnings.length} warnings.` : "Validation OK." });
@@ -1182,86 +1136,98 @@ export default function App() {
         <div className="card-body">
           <div className={`map-shell ${selectedRouteId ? "bw" : ""} ${drawMode ? "is-drawing" : ""}`} style={{ height: 520, width: "100%", borderRadius: 12, overflow: "hidden", position: "relative" }}>
             <MapContainer center={[40.4168, -3.7038]} zoom={6} style={{ height: "100%", width: "100%" }}>
-            <TileLayer
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              attribution="© OpenStreetMap contributors"
-            />
+              <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="© OpenStreetMap contributors" />
+              <Pane name="routeHalo" style={{ zIndex: 390 }} />
+              <Pane name="routeLines" style={{ zIndex: 400 }} />
+              <Pane name="stopsTop"  style={{ zIndex: 650 }} />
+              {!drawMode && <AddStopOnClick onAdd={addStopFromMap} onTooFar={() => setBanner({ kind: "info", text: `Zoom in to at least ${MIN_ADD_ZOOM} to add stops.` })} />}
+              {drawMode && <DrawShapeOnClick onPoint={() => {}} onFinish={() => setDrawMode(false)} />}
 
-            {/* Declare panes ONCE */}
-            <Pane name="routeHalo" style={{ zIndex: 390 }} />
-            <Pane name="routeLines" style={{ zIndex: 400 }} />
-            <Pane name="stopsTop"  style={{ zIndex: 650 }} />
+              {stops.map(s => (
+                <CircleMarker
+                  key={s.uid}
+                  center={[s.stop_lat, s.stop_lon]}
+                  pane="stopsTop"
+                  radius={selectedRouteId ? 3.5 : 3}
+                  color={selectedStopId === s.stop_id ? "#e11d48" : "#111"}
+                  weight={1.5}
+                  fillColor="#fff"
+                  fillOpacity={1}
+                  eventHandlers={{ click: () => setSelectedStopId(s.stop_id) }}
+                />
+              ))}
 
-            {!drawMode && (
-              <AddStopOnClick
-                onAdd={addStopFromMap}
-                onTooFar={() => setBanner({ kind: "info", text: `Zoom in to at least ${MIN_ADD_ZOOM} to add stops.` })}
-              />
-            )}
-            {drawMode && <DrawShapeOnClick onPoint={() => {}} onFinish={() => setDrawMode(false)} />}
+              {Array.from(routePolylines.entries()).map(([route_id, coords]) => {
+                const isSel = selectedRouteId === route_id || selectedRouteIds.has(route_id);
+                const hasSel = !!selectedRouteId || selectedRouteIds.size > 0;
+                const color   = hasSel ? (isSel ? routeColor(route_id) : DIM_ROUTE_COLOR) : routeColor(route_id);
+                const weight  = isSel ? 6 : 3;
+                const opacity = hasSel ? (isSel ? 0.95 : 0.6) : 0.95;
 
-            {/* STOPS — render directly, just set pane="stopsTop" */}
-            {stops.map(s => (
-              <CircleMarker
-                key={s.uid}
-                center={[s.stop_lat, s.stop_lon]}
-                pane="stopsTop"
-                radius={selectedRouteId ? 3.5 : 3}
-                color={selectedStopId === s.stop_id ? "#e11d48" : "#111"}
-                weight={1.5}
-                fillColor="#fff"
-                fillOpacity={1}
-                eventHandlers={{ click: () => setSelectedStopId(s.stop_id) }}
-              />
-            ))}
-
-            {/* ROUTES — lines in routeLines; halo in routeHalo */}
-            {Array.from(routePolylines.entries()).map(([route_id, coords]) => {
-              const isSel = selectedRouteId === route_id;
-              const hasSel = !!selectedRouteId;
-
-              const color   = hasSel ? (isSel ? routeColor(route_id) : DIM_ROUTE_COLOR) : routeColor(route_id);
-              const weight  = isSel ? 6 : 3;
-              const opacity = hasSel ? (isSel ? 0.95 : 0.6) : 0.95;
-
-              return (
-                <div key={route_id}>
-                  {isSel && (
+                return (
+                  <div key={route_id}>
+                    {isSel && (
+                      <Polyline
+                        positions={coords as any}
+                        pane="routeHalo"
+                        className="route-halo-pulse"
+                        pathOptions={{ color: "#ffffff", weight: 10, opacity: 0.9, lineCap: "round" }}
+                        eventHandlers={{ click: () => setSelectedRouteId(route_id) }}
+                      />
+                    )}
                     <Polyline
                       positions={coords as any}
-                      pane="routeHalo"
-                      className="route-halo-pulse"                 // <-- add this
-                      pathOptions={{ color: "#ffffff", weight: 10, opacity: 0.9, lineCap: "round" }}
+                      pane="routeLines"
+                      pathOptions={{ color, weight, opacity }}
                       eventHandlers={{ click: () => setSelectedRouteId(route_id) }}
                     />
-                  )}
-                  <Polyline
-                    positions={coords as any}
-                    pane="routeLines"
-                    pathOptions={{ color, weight, opacity }}
-                    eventHandlers={{ click: () => setSelectedRouteId(route_id) }}
-                  />
-                </div>
-              );
-            })}
-          </MapContainer>
+                  </div>
+                );
+              })}
+            </MapContainer>
           </div>
         </div>
       </div>
 
-      {/* routes.txt — selected route appears FIRST; click any field selects; ✓ deselects */}
+      {/* routes.txt — multi-select + delete button + tiny full-row selection */}
       <PaginatedEditableTable
         title="routes.txt"
         rows={routes}
         onChange={setRoutes}
         visibleIndex={routesVisibleIdx}
         initialPageSize={10}
-        onRowClick={(r) => setSelectedRouteId((r as RouteRow).route_id)}
-        selectedPredicate={(r) => (r as RouteRow).route_id === selectedRouteId}
+        onRowClick={(row, e) => {
+          const rid = (row as RouteRow).route_id;
+          const meta = (e.metaKey || e.ctrlKey);
+          if (meta) {
+            setSelectedRouteIds(prev => {
+              const next = new Set(prev);
+              next.has(rid) ? next.delete(rid) : next.add(rid);
+              if (next.size === 1) setSelectedRouteId(rid);
+              return next;
+            });
+          } else {
+            setSelectedRouteIds(new Set([rid]));
+            setSelectedRouteId(rid);
+          }
+        }}
+        selectedPredicate={(r) => {
+          const rid = (r as RouteRow).route_id;
+          return selectedRouteIds.has(rid) || rid === selectedRouteId;
+        }}
         selectedIcon="✓"
         clearSignal={clearSignal}
-        onIconClick={() => setSelectedRouteId(null)}
-        selectOnCellFocus // <— clicking/focusing any cell selects that route
+        onIconClick={(r) => {
+          const rid = (r as RouteRow).route_id;
+          setSelectedRouteIds(prev => { const n = new Set(prev); n.delete(rid); return n; });
+          if (selectedRouteId === rid) setSelectedRouteId(null);
+        }}
+        selectOnCellFocus
+        onDeleteRow={(r) => {
+          const rid = (r as RouteRow).route_id;
+          if (confirm(`Delete route ${rid}?`)) hardDeleteRoute(rid);
+        }}
+        enableMultiSelect
       />
 
       {/* Service chips */}
@@ -1306,37 +1272,50 @@ export default function App() {
       {/* Patterns for selected route */}
       {selectedRouteId ? (
         <PatternMatrix
-          route={routes.find(r => r.route_id === selectedRouteId)!}
-          trips={(tripsByRoute.get(selectedRouteId) ?? [])}
           stops={stops}
-          stopTimes={stopTimes.filter(st => (tripsByRoute.get(selectedRouteId) ?? []).some(t => t.trip_id === st.trip_id))}
           services={services}
-          activeServiceIds={activeServiceIds}
-          onEditTime={(trip_id, stop_id, newUiTime) => handleEditTime(trip_id, stop_id, gtfsFromUi(newUiTime))}
-          onDeleteStopRow={handleDeleteStopRow}
+          trips={(tripsByRoute.get(selectedRouteId) ?? [])}
+          stopTimes={stopTimes.filter(st =>
+            (tripsByRoute.get(selectedRouteId) ?? []).some(t => t.trip_id === st.trip_id)
+          )}
+          selectedRouteId={selectedRouteId}
+          initialRestrictions={project?.extras?.restrictions}
+          onRestrictionsChange={handleRestrictionsChange}
+
+          onEditTime={(trip_id, stop_id, newUiTime) => {
+            setStopTimes(prev => prev.map(st =>
+              st.trip_id === trip_id && st.stop_id === stop_id
+                ? {
+                    ...st,
+                    departure_time: newUiTime, // HH:MM
+                    arrival_time: st.arrival_time ? st.arrival_time : newUiTime,
+                  }
+                : st
+            ));
+          }}
         />
       ) : (
         <div className="card section" style={{ marginTop: 12 }}>
           <div className="card-body">
-            <h3 style={{ margin: 0 }}>Select a route to view Excel-like patterns</h3>
-            <p style={{ opacity: .7, marginTop: 6 }}>Click a polyline on the map or any cell in <strong>routes.txt</strong>. Press <kbd>Esc</kbd> to deselect.</p>
+            <h3>Select a route to view Excel-like patterns</h3>
+            <p style={{ opacity: 0.7, marginTop: 6 }}>Click a polyline on the map or any row in <strong>routes.txt</strong>.</p>
           </div>
         </div>
       )}
 
-      {/* ---------- OTHER GTFS TABLES (editable) ---------- */}
+      {/* OTHER GTFS TABLES (each row has a delete button now) */}
       <div style={{ marginTop: 12 }}>
         <PaginatedEditableTable
           title="agency.txt"
           rows={agencies}
           onChange={setAgencies}
           initialPageSize={5}
+          onDeleteRow={(row) => setAgencies(prev => prev.filter(a => a !== row))}
         />
         <PaginatedEditableTable
           title="stops.txt"
           rows={stops.map(s => ({ stop_id: s.stop_id, stop_name: s.stop_name, stop_lat: s.stop_lat, stop_lon: s.stop_lon }))}
           onChange={(next) => {
-            // merge back into stops (keep uid)
             const uidById = new Map(stops.map(s => [s.stop_id, s.uid]));
             setStops(next.map((r: any) => ({
               uid: uidById.get(r.stop_id) || uuidv4(),
@@ -1344,24 +1323,50 @@ export default function App() {
             })));
           }}
           initialPageSize={5}
+          onDeleteRow={(r:any) => {
+            const sid = r.stop_id;
+            if (!sid) return;
+            if (!confirm(`Delete stop ${sid}?`)) return;
+            setStops(prev => prev.filter(s => s.stop_id !== sid));
+            setStopTimes(prev => prev.filter(st => st.stop_id !== sid));
+          }}
         />
         <PaginatedEditableTable
           title="calendar.txt"
           rows={services}
           onChange={setServices}
           initialPageSize={5}
+          onDeleteRow={(row:any) => {
+            const sid = row.service_id;
+            if (!sid) return;
+            if (!confirm(`Delete service ${sid}? Trips using it will remain with dangling reference.`)) return;
+            setServices(prev => prev.filter(s => s.service_id !== sid));
+          }}
         />
         <PaginatedEditableTable
           title="trips.txt"
           rows={trips}
           onChange={setTrips}
           initialPageSize={10}
+          onDeleteRow={(row:any) => {
+            const tid = row.trip_id;
+            if (!tid) return;
+            if (!confirm(`Delete trip ${tid}?`)) return;
+            setTrips(prev => prev.filter(t => t.trip_id !== tid));
+            setStopTimes(prev => prev.filter(st => st.trip_id !== tid));
+          }}
         />
         <PaginatedEditableTable
           title="stop_times.txt"
           rows={stopTimes}
           onChange={setStopTimes}
           initialPageSize={10}
+          onDeleteRow={(row:any) => {
+            // delete this specific row in stop_times
+            setStopTimes(prev => prev.filter(st =>
+              !(st.trip_id === row.trip_id && st.stop_id === row.stop_id && String(st.stop_sequence) === String(row.stop_sequence))
+            ));
+          }}
         />
         <PaginatedEditableTable
           title="shapes.txt"
@@ -1370,6 +1375,9 @@ export default function App() {
             setShapePts(next.map((r: any) => ({ shape_id: r.shape_id, lat: Number(r.shape_pt_lat), lon: Number(r.shape_pt_lon), seq: Number(r.shape_pt_sequence) })));
           }}
           initialPageSize={10}
+          onDeleteRow={(row:any) => {
+            setShapePts(prev => prev.filter(p => !(p.shape_id === row.shape_id && p.seq === row.shape_pt_sequence)));
+          }}
         />
       </div>
 
