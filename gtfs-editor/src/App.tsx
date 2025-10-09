@@ -47,7 +47,29 @@ type Agency = { agency_id: string; agency_name: string; agency_url: string; agen
 type Issue = { level: "error" | "warning"; file: string; row?: number; message: string };
 type Banner = { kind: "success" | "error" | "info"; text: string } | null;
 
+
+type StopRuleMode = "normal" | "pickup" | "dropoff" | "custom";
+type ODRestriction = {
+  mode: StopRuleMode;
+  dropoffOnlyFrom?: string[];
+  pickupOnlyTo?: string[];
+};
+type RestrictionsMap = Record<string, ODRestriction>;
+
+
 /** ---------- Helpers ---------- */
+function normalizeRule(raw: any): ODRestriction {
+  const mode: StopRuleMode =
+    raw?.mode === "pickup" || raw?.mode === "dropoff" || raw?.mode === "custom"
+      ? raw.mode
+      : "normal";
+  return {
+    mode,
+    dropoffOnlyFrom: Array.isArray(raw?.dropoffOnlyFrom) ? raw.dropoffOnlyFrom.map(String) : undefined,
+    pickupOnlyTo: Array.isArray(raw?.pickupOnlyTo) ? raw.pickupOnlyTo.map(String) : undefined,
+  };
+}
+
 function toYYYYMMDD(d: string | Date) {
   const date = typeof d === "string" ? new Date(d) : d;
   const y = date.getFullYear();
@@ -575,6 +597,50 @@ export default function App() {
       setTimeout(() => setBanner(null), 2200);
     } catch {
       setBanner({ kind: "error", text: "Invalid project JSON." });
+      setTimeout(() => setBanner(null), 3200);
+    }
+  };
+
+  const importOverrides = async (file: File) => {
+    try {
+      const json = JSON.parse(await file.text());
+      // Accept both { rules: { "trip::stop": {...} } } and a raw map
+      const rules: RestrictionsMap = (json?.rules ?? json) as RestrictionsMap;
+
+      // Build the set of (trip_id::stop_id) pairs present in the loaded feed
+      const presentPairs = new Set(stopTimes.map(st => `${st.trip_id}::${st.stop_id}`));
+
+      // Start from current restrictions (so we merge, don’t blow away user edits)
+      const current: RestrictionsMap = (project?.extras?.restrictions ?? {}) as RestrictionsMap;
+      const next: RestrictionsMap = { ...current };
+
+      let total = 0;
+      let matched = 0;
+      let skipped = 0;
+
+      for (const [key, rawRule] of Object.entries(rules)) {
+        total++;
+        if (presentPairs.has(key)) {
+          next[key] = normalizeRule(rawRule);
+          matched++;
+        } else {
+          skipped++;
+        }
+      }
+
+      setProject((prev: any) => ({
+        ...(prev ?? {}),
+        extras: { ...(prev?.extras ?? {}), restrictions: next },
+      }));
+
+      setBanner({
+        kind: "success",
+        text: `Overrides: applied ${matched}/${total}${skipped ? ` (${skipped} unmatched)` : ""}.`,
+      });
+      setTimeout(() => setBanner(null), 3200);
+    } catch (e) {
+      console.error(e);
+      setBanner({ kind: "error", text: "Invalid overrides.json" });
       setTimeout(() => setBanner(null), 3200);
     }
   };
@@ -1111,6 +1177,21 @@ export default function App() {
           </label>
 
           <label className="file-btn">
+            Import overrides.json
+            <input
+              type="file"
+              accept="application/json"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) importOverrides(f);
+                // reset input so you can re-upload the same file later if needed
+                (e.target as HTMLInputElement).value = "";
+              }}
+            />
+          </label>
+
+          <label className="file-btn">
             Import GTFS .zip
             <input type="file" accept=".zip" style={{ display: "none" }}
               onChange={e => { const f = e.target.files?.[0]; if (f) importGTFSZip(f); }} />
@@ -1118,6 +1199,31 @@ export default function App() {
 
           <button className="btn btn-primary" onClick={onExportGTFS}>Export GTFS .zip</button>
           <button className="btn" onClick={exportGtfsCompiled}>Export GTFS (compile OD)</button>
+
+          <button
+            className="btn"
+            onClick={() => {
+              // grab ALL rules (not just selected route)
+              const allRules = (project?.extras?.restrictions ?? {}) as Record<string, any>;
+
+              // keep only non-"normal" (i.e., where you actually set pickup/dropoff/custom)
+              const pruned: Record<string, any> = {};
+              for (const [k, v] of Object.entries(allRules)) {
+                if (!v) continue;
+                if (v.mode && v.mode !== "normal") pruned[k] = v;
+              }
+
+              const blob = new Blob(
+                [JSON.stringify({ version: 1, rules: pruned }, null, 2)],
+                { type: "application/json" }
+              );
+              saveAs(blob, "overrides.json");
+              setBanner({ kind: "success", text: "Exported all custom pickup/dropoff rules." });
+              setTimeout(() => setBanner(null), 2000);
+            }}
+          >
+            Export custom rules
+          </button>
 
           <button className="btn" onClick={() => {
             const res = runValidation();

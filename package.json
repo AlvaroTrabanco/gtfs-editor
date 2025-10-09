@@ -1,13 +1,20 @@
 {
+  "name": "gtfs-automation",
+  "version": "1.0.0",
+  "type": "module",
   "scripts": {
+    "flix:build": "node automation/rebuild-flixbus.js",
+    "flix:daily": "node automation/rebuild-flixbus.js",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
+    "jszip": "^3.10.1",
+    "papaparse": "^5.4.1",
+    "node-fetch": "^3.3.2",
     "date-fns": "^4.1.0",
     "file-saver": "^2.0.5",
-    "jszip": "^3.10.1",
     "leaflet": "^1.9.4",
     "lucide-react": "^0.544.0",
     "react": "^18.3.1",
@@ -26,3 +33,5 @@
     "vite": "^5.4.0"
   }
 }
+
+  
