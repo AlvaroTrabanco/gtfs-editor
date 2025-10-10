@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState,useCallback } from "react";
+import { unstable_batchedUpdates } from "react-dom";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { MapContainer, TileLayer, Polyline, CircleMarker, useMapEvents, useMap, Pane } from "react-leaflet";
 import L from "leaflet";
 import JSZip from "jszip";
@@ -14,6 +15,7 @@ import PatternMatrix from "./PatternMatrix";
 const defaultTZ: string = String(Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Madrid");
 const MIN_ADD_ZOOM = 15;
 const DIM_ROUTE_COLOR = "#2b2b2b"; // single gray for all non-selected routes
+
 
 /** ---------- Types ---------- */
 type Stop = { uid: string; stop_id: string; stop_name: string; stop_lat: number; stop_lon: number };
@@ -532,6 +534,11 @@ export default function App() {
   const [selectedRouteIds, setSelectedRouteIds] = useState<Set<string>>(new Set()); // NEW multi-select
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
 
+  /** Busy / thinking button */
+  const [busy, setBusy] = useState<{ on: boolean; label: string }>({ on: false, label: "" });
+  const startBusy = (label: string) => setBusy({ on: true, label });
+  const stopBusy  = () => setBusy({ on: false, label: "" });
+
   /** Filters / clearing */
   const [activeServiceIds, setActiveServiceIds] = useState<Set<string>>(new Set());
   const [clearSignal, setClearSignal] = useState(0);
@@ -539,15 +546,33 @@ export default function App() {
   /** Validation & banner */
   const [validation, setValidation] = useState<{ errors: Issue[]; warnings: Issue[] }>({ errors: [], warnings: [] });
   const [banner, setBanner] = useState<Banner>(null);
+  // Busy/lock UI while long ops run
+  const [isBusy, setIsBusy] = useState(false);
+  const [busyLabel, setBusyLabel] = useState<string | null>(null);
+  const withBusy = async (label: string, fn: () => Promise<void> | void) => {
+    if (isBusy) return;           // ignore re-entrancy
+    setIsBusy(true);
+    setBusyLabel(label);
+    try {
+      await fn();
+    } finally {
+      setIsBusy(false);
+      setBusyLabel(null);
+    }
+  };
+  const saveTimer = useRef<number | undefined>(undefined);
+  const suppressPersist = useRef(false);
 
   /** Persistence */
   const STORAGE_KEY = "gtfs_builder_state_v1";
   const [hydrated, setHydrated] = useState(false);
+
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const obj = JSON.parse(raw);
+
         setAgencies(obj.agencies ?? []);
         setStops((obj.stops ?? []).map((s: any) => ({ uid: s.uid || uuidv4(), ...s })));
         setRoutes(obj.routes ?? []);
@@ -555,16 +580,59 @@ export default function App() {
         setTrips(obj.trips ?? []);
         setStopTimes(obj.stopTimes ?? []);
         setShapePts(obj.shapePts ?? []);
+
+        // ⬇️ restore OD rules (supports old/new shapes of the saved object)
+        const savedRules =
+          obj.project?.extras?.restrictions ??
+          obj.extras?.restrictions ??
+          obj.restrictions ??
+          {};
+        setProject((prev: any) => ({
+          ...(prev ?? {}),
+          extras: { ...(prev?.extras ?? {}), restrictions: savedRules },
+        }));
       }
-    } catch {/* ignore */}
+    } catch {
+      /* ignore */
+    }
     setHydrated(true);
   }, []);
+
   useEffect(() => {
-    if (!hydrated) return;
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ agencies, stops, routes, services, trips, stopTimes, shapePts }));
-    } catch {/* ignore */}
-  }, [hydrated, agencies, stops, routes, services, trips, stopTimes, shapePts]);
+    if (!hydrated || suppressPersist.current) return;
+
+    // Clear any pending save
+    if (saveTimer.current) window.clearTimeout(saveTimer.current);
+
+    // Debounce ~600ms after the latest change
+    saveTimer.current = window.setTimeout(() => {
+      try {
+        const snapshot = {
+          agencies,
+          stops,
+          routes,
+          services,
+          trips,
+          stopTimes,
+          shapePts,
+          project: { extras: { restrictions: project?.extras?.restrictions ?? {} } },
+        };
+        const json = JSON.stringify(snapshot);
+        if (json.length < 5_000_000) {
+          localStorage.setItem(STORAGE_KEY, json);
+        } else {
+          console.warn("Skipping autosave: feed too large for localStorage");
+        }
+      } catch (err) {
+        console.warn("LocalStorage save failed:", err);
+      }
+    }, 600) as unknown as number;
+
+    return () => {
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated, agencies, stops, routes, services, trips, stopTimes, shapePts, project?.extras?.restrictions]);
 
   /** Colors */
   function hashCode(str: string) { let h = 0; for (let i=0;i<str.length;i++) h = ((h<<5)-h) + str.charCodeAt(i) | 0; return h; }
@@ -586,6 +654,10 @@ export default function App() {
   const importProject = async (file: File) => {
     try {
       const obj = JSON.parse(await file.text());
+
+      startBusy("Loading project…");
+      suppressPersist.current = true;
+
       setAgencies(obj.agencies ?? []);
       setStops((obj.stops ?? []).map((s: any) => ({ uid: s.uid || uuidv4(), ...s })));
       setRoutes(obj.routes ?? []);
@@ -593,11 +665,27 @@ export default function App() {
       setTrips(obj.trips ?? []);
       setStopTimes(obj.stopTimes ?? []);
       setShapePts(obj.shapePts ?? []);
+
+      // restore rules
+      const savedRules =
+        obj.project?.extras?.restrictions ??
+        obj.extras?.restrictions ??
+        obj.restrictions ?? {};
+      setProject((prev: any) => ({
+        ...(prev ?? {}),
+        extras: { ...(prev?.extras ?? {}), restrictions: savedRules },
+      }));
+
       setBanner({ kind: "success", text: "Project imported." });
       setTimeout(() => setBanner(null), 2200);
+
+      // resume autosave after paint
+      queueMicrotask(() => { suppressPersist.current = false; });
     } catch {
       setBanner({ kind: "error", text: "Invalid project JSON." });
       setTimeout(() => setBanner(null), 3200);
+    } finally {
+      stopBusy();
     }
   };
 
@@ -648,6 +736,9 @@ export default function App() {
   /** Import GTFS .zip */
   const importGTFSZip = async (file: File) => {
     try {
+      startBusy("Parsing GTFS…");
+      suppressPersist.current = true;
+
       const zip = await JSZip.loadAsync(file);
       const tables: Record<string, string> = {};
       for (const entry of Object.values(zip.files)) {
@@ -656,7 +747,8 @@ export default function App() {
         if (!f.name?.toLowerCase().endsWith(".txt")) continue;
         tables[f.name.replace(/\.txt$/i, "")] = await f.async("string");
       }
-      const parse = (text: string) => (Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true }).data as any[]) || [];
+      const parse = (text: string) =>
+        (Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true }).data as any[]) || [];
 
       if (tables["agency"]) {
         setAgencies(parse(tables["agency"]).map((r: any) => ({
@@ -694,17 +786,16 @@ export default function App() {
           trip_id: String(r.trip_id ?? ""),
           trip_headsign: r.trip_headsign != null ? String(r.trip_headsign) : undefined,
           shape_id: r.shape_id != null ? String(r.shape_id) : undefined,
-          direction_id: r.direction_id != null && r.direction_id !== "" ? Number(r.direction_id) : undefined, // ← force number
+          direction_id: r.direction_id != null && r.direction_id !== "" ? Number(r.direction_id) : undefined,
         })));
       }
-
       if (tables["stop_times"]) {
         setStopTimes(parse(tables["stop_times"]).map((r: any) => ({
           trip_id: String(r.trip_id ?? ""),
           arrival_time: String(r.arrival_time ?? ""),
           departure_time: String(r.departure_time ?? ""),
           stop_id: String(r.stop_id ?? ""),
-          stop_sequence: Number(r.stop_sequence ?? 0),  // ← force number
+          stop_sequence: Number(r.stop_sequence ?? 0),
           pickup_type: r.pickup_type != null && r.pickup_type !== "" ? Number(r.pickup_type) : undefined,
           drop_off_type: r.drop_off_type != null && r.drop_off_type !== "" ? Number(r.drop_off_type) : undefined,
         })));
@@ -719,10 +810,14 @@ export default function App() {
 
       setBanner({ kind: "success", text: "GTFS zip imported." });
       setTimeout(() => setBanner(null), 2200);
+
+      queueMicrotask(() => { suppressPersist.current = false; });
     } catch (e) {
       console.error(e);
       setBanner({ kind: "error", text: "Failed to import GTFS zip." });
       setTimeout(() => setBanner(null), 3200);
+    } finally {
+      stopBusy();
     }
   };
 
@@ -766,6 +861,7 @@ export default function App() {
   }, [trips]);
 
   const routePolylines = useMemo(() => {
+    if (isBusy) return new Map<string, [number, number][]>();
     const out = new Map<string, [number, number][]>();
 
     for (const r of routes) {
@@ -798,7 +894,7 @@ export default function App() {
     }
 
     return out;
-  }, [routes, tripsByRoute, shapesById, stopTimesByTrip, stopsById]);
+  }, [isBusy, routes, tripsByRoute, shapesById, stopTimesByTrip, stopsById]);
 
   /** ---------- Selection & ordering ---------- */
   // Visual: selected route first
@@ -885,9 +981,14 @@ export default function App() {
   };
 
   const onExportGTFS = async () => {
-    const { errors } = runValidation();
-    if (errors.length) { alert("Fix validation errors before exporting."); return; }
-    await exportGTFSZip({ agencies, stops, routes, services, trips, stopTimes, shapePts });
+    startBusy("Preparing GTFS…");
+    try {
+      const { errors } = runValidation();
+      if (errors.length) { alert("Fix validation errors before exporting."); return; }
+      await exportGTFSZip({ agencies, stops, routes, services, trips, stopTimes, shapePts });
+    } finally {
+      stopBusy();
+    }
   };
 
   const resetAll = () => {
@@ -941,36 +1042,38 @@ export default function App() {
     });
   };
 
-  /** Delete a route and its dependent data */
+  /** Delete a route and all dependent data (memory-safe & batched) */
   const hardDeleteRoute = (route_id: string) => {
-    // figure out which trips/stops will go away BEFORE we mutate state
-    const doomedTrips = trips.filter(t => t.route_id === route_id).map(t => t.trip_id);
-    const doomedTripSet = new Set(doomedTrips);
-    const doomedKeys = new Set<string>();
-    stopTimes.forEach(st => { if (doomedTripSet.has(st.trip_id)) doomedKeys.add(`${st.trip_id}::${st.stop_id}`); });
-
-    // purge restrictions for those (trip,stop) pairs
-    setProject((prev: any) => {
-      const curr: Record<string, any> = prev?.extras?.restrictions ?? {};
-      const next: Record<string, any> = { ...curr };
-      doomedKeys.forEach(k => { delete next[k]; });
-      return { ...(prev ?? {}), extras: { ...(prev?.extras ?? {}), restrictions: next } };
-    });
-
-    // now prune the GTFS tables
-    const remainingTrips = trips.filter(t => t.route_id !== route_id);
-    const remainingTripIds = new Set(remainingTrips.map(t => t.trip_id));
-    setTrips(remainingTrips);
-    setStopTimes(prev => prev.filter(st => remainingTripIds.has(st.trip_id)));
-    setShapePts(prev => {
+    try {
+      const doomedTrips = new Set(trips.filter(t => t.route_id === route_id).map(t => t.trip_id));
+      const remainingTrips = trips.filter(t => t.route_id !== route_id);
       const keptShapeIds = new Set(remainingTrips.map(t => t.shape_id).filter(Boolean) as string[]);
-      return prev.filter(s => keptShapeIds.has(s.shape_id));
-    });
-    setRoutes(prev => prev.filter(r => r.route_id !== route_id));
 
-    // clean up selections
-    setSelectedRouteIds(prev => { const n = new Set(prev); n.delete(route_id); return n; });
-    if (selectedRouteId === route_id) setSelectedRouteId(null);
+      unstable_batchedUpdates(() => {
+        setProject((prev: any) => {
+          const curr: Record<string, any> = prev?.extras?.restrictions ?? {};
+          const next: Record<string, any> = {};
+          for (const [k, v] of Object.entries(curr)) {
+            const [trip_id] = k.split("::");
+            if (!doomedTrips.has(trip_id)) next[k] = v;
+          }
+          return { ...(prev ?? {}), extras: { ...(prev?.extras ?? {}), restrictions: next } };
+        });
+
+        setTrips(remainingTrips);
+        setStopTimes(prev => prev.filter(st => !doomedTrips.has(st.trip_id)));
+        setShapePts(prev => prev.filter(p => keptShapeIds.has(p.shape_id)));
+        setRoutes(prev => prev.filter(r => r.route_id !== route_id));
+
+        // selection cleanup with busy guard already active
+        setSelectedRouteIds(prev => { const n = new Set(prev); n.delete(route_id); return n; });
+        if (selectedRouteId === route_id) setSelectedRouteId(null);
+      });
+    } catch (e) {
+      console.error(e);
+      setBanner({ kind: "error", text: "Delete failed. Try again." });
+      setTimeout(() => setBanner(null), 3000);
+    }
   };
 
   /** Delete selected stop (from stops + all stop_times) */
@@ -1160,7 +1263,19 @@ export default function App() {
   /** ---------- Render ---------- */
   return (
     <div className="container" style={{ padding: 16 }}>
-      <style>{`
+      <style>{`.busy-fab {
+          position: fixed; right: 16px; bottom: 16px;
+          background: #111; color: #fff; border: none; border-radius: 999px;
+          padding: 10px 14px; box-shadow: 0 8px 24px rgba(0,0,0,.18);
+          display: inline-flex; align-items: center; gap: 8px; z-index: 9999;
+          opacity: .92; cursor: default;
+        }
+        .spinner {
+          width: 16px; height: 16px; border-radius: 50%;
+          border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
+          animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
         .map-shell.bw .leaflet-tile { filter: grayscale(1) contrast(1.05) brightness(1.0); }
         .route-halo-pulse { animation: haloPulse 1.8s ease-in-out infinite !important; filter: drop-shadow(0 0 4px rgba(255,255,255,0.9)); stroke: #ffffff !important; stroke-linecap: round !important; }
         @keyframes haloPulse { 0%{stroke-opacity:.65;stroke-width:10px;} 50%{stroke-opacity:.2;stroke-width:16px;} 100%{stroke-opacity:.65;stroke-width:10px;} }
@@ -1189,13 +1304,54 @@ export default function App() {
           </label>
 
           {selectedRouteIds.size > 0 && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, background: "#f6f7f9", padding: "6px 10px", borderRadius: 10 }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                background: "#f6f7f9",
+                padding: "6px 10px",
+                borderRadius: 10
+              }}
+            >
               Selected: <b>{Array.from(selectedRouteIds).join(", ")}</b>
-              <button className="btn" onClick={() => { setSelectedRouteIds(new Set()); setSelectedRouteId(null); }} title="Clear selection">×</button>
-              <button className="btn btn-danger" onClick={() => {
-                if (!confirm(`Delete ${selectedRouteIds.size} route(s)?`)) return;
-                Array.from(selectedRouteIds).forEach(hardDeleteRoute);
-              }}>Delete selected</button>
+
+              <button
+                className="btn"
+                title="Clear selection"
+                disabled={isBusy}
+                onClick={() => {
+                  if (isBusy) return;
+                  setSelectedRouteIds(new Set());
+                  setSelectedRouteId(null);
+                }}
+              >
+                ×
+              </button>
+
+              <button
+                className="btn btn-danger"
+                disabled={isBusy}
+                aria-busy={isBusy ? "true" : "false"}
+                onClick={() =>
+                  withBusy(`Deleting ${selectedRouteIds.size} route(s)…`, async () => {
+                    if (!confirm(`Delete ${selectedRouteIds.size} route(s)?`)) return;
+
+                    // delete sequentially to avoid thrashing; yield a tick between each
+                    for (const rid of Array.from(selectedRouteIds)) {
+                      hardDeleteRoute(rid);
+                      // let React flush state; keeps UI responsive on big feeds
+                      await Promise.resolve();
+                    }
+
+                    // clear selection after deletion
+                    setSelectedRouteIds(new Set());
+                    setSelectedRouteId(null);
+                  })
+                }
+              >
+                Delete selected
+              </button>
             </div>
           )}
 
@@ -1236,8 +1392,16 @@ export default function App() {
 
           <label className="file-btn">
             Import GTFS .zip
-            <input type="file" accept=".zip" style={{ display: "none" }}
-              onChange={e => { const f = e.target.files?.[0]; if (f) importGTFSZip(f); }} />
+            <input
+              type="file"
+              accept=".zip"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) importGTFSZip(f);
+                (e.target as HTMLInputElement).value = "";
+              }}
+            />
           </label>
 
           <button className="btn btn-primary" onClick={onExportGTFS}>Export GTFS .zip</button>
@@ -1268,13 +1432,26 @@ export default function App() {
             Export custom rules
           </button>
 
-          <button className="btn" onClick={() => {
-            const res = runValidation();
-            setValidation(res);
-            setBanner(res.errors.length ? { kind: "error", text: `Validation found ${res.errors.length} errors and ${res.warnings.length} warnings.` }
-                                        : { kind: "success", text: res.warnings.length ? `Validation OK with ${res.warnings.length} warnings.` : "Validation OK." });
-            setTimeout(() => setBanner(null), 3200);
-          }}>Validate</button>
+          <button
+            className="btn"
+            onClick={async () => {
+              startBusy("Validating…");
+              try {
+                const res = runValidation();
+                setValidation(res);
+                setBanner(
+                  res.errors.length
+                    ? { kind: "error", text: `Validation found ${res.errors.length} errors and ${res.warnings.length} warnings.` }
+                    : { kind: "success", text: res.warnings.length ? `Validation OK with ${res.warnings.length} warnings.` : "Validation OK." }
+                );
+                setTimeout(() => setBanner(null), 3200);
+              } finally {
+                stopBusy();
+              }
+            }}
+          >
+            Validate
+          </button>
 
           <button className="btn btn-danger" onClick={resetAll}>Reset</button>
         </div>
@@ -1284,6 +1461,20 @@ export default function App() {
       <div className="card section">
         <div className="card-body">
           <div className={`map-shell ${selectedRouteId ? "bw" : ""} ${drawMode ? "is-drawing" : ""}`} style={{ height: 520, width: "100%", borderRadius: 12, overflow: "hidden", position: "relative" }}>
+            {isBusy && (
+              <div
+                style={{
+                  position: "absolute", inset: 0, background: "rgba(255,255,255,0.6)",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  zIndex: 1000, backdropFilter: "blur(1px)", pointerEvents: "auto"
+                }}
+              >
+                <div style={{ padding: "10px 14px", borderRadius: 10, background: "#fff", boxShadow: "0 2px 10px rgba(0,0,0,.12)", display:"flex", gap:10, alignItems:"center" }}>
+                  <span className="spinner" />
+                  <span>{busyLabel || "Working…"}</span>
+                </div>
+              </div>
+            )}
             <MapContainer center={[40.4168, -3.7038]} zoom={6} style={{ height: "100%", width: "100%" }}>
               <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="© OpenStreetMap contributors" />
               <Pane name="routeHalo" style={{ zIndex: 390 }} />
@@ -1302,7 +1493,7 @@ export default function App() {
                   weight={1.5}
                   fillColor="#fff"
                   fillOpacity={1}
-                  eventHandlers={{ click: () => setSelectedStopId(s.stop_id) }}
+                  eventHandlers={{ click: () => { if (isBusy) return; setSelectedStopId(s.stop_id); } }}
                 />
               ))}
 
@@ -1321,14 +1512,14 @@ export default function App() {
                         pane="routeHalo"
                         className="route-halo-pulse"
                         pathOptions={{ color: "#ffffff", weight: 10, opacity: 0.9, lineCap: "round" }}
-                        eventHandlers={{ click: () => setSelectedRouteId(route_id) }}
+                        eventHandlers={{ click: () => { if (isBusy) return; setSelectedRouteId(route_id); } }}
                       />
                     )}
                     <Polyline
                       positions={coords as any}
                       pane="routeLines"
                       pathOptions={{ color, weight, opacity }}
-                      eventHandlers={{ click: () => setSelectedRouteId(route_id) }}
+                      eventHandlers={{ click: () => { if (isBusy) return; setSelectedRouteId(route_id); } }}
                     />
                   </div>
                 );
@@ -1346,6 +1537,7 @@ export default function App() {
         visibleIndex={routesVisibleIdx}
         initialPageSize={10}
         onRowClick={(row, e) => {
+          if (isBusy) return;
           const rid = (row as RouteRow).route_id;
           const meta = (e.metaKey || e.ctrlKey);
           if (meta) {
@@ -1445,7 +1637,7 @@ export default function App() {
       ) : (
         <div className="card section" style={{ marginTop: 12 }}>
           <div className="card-body">
-            <h3>Select a route to view Excel-like patterns</h3>
+            <h3>Select a route to view all its departures together</h3>
             <p style={{ opacity: 0.7, marginTop: 6 }}>Click a polyline on the map or any row in <strong>routes.txt</strong>.</p>
           </div>
         </div>
@@ -1554,6 +1746,12 @@ export default function App() {
           </p>
         </div>
       </div>
+      {busy.on && (
+        <button className="busy-fab" aria-busy="true" title={busy.label}>
+          <span className="spinner" />
+          <span>{busy.label}</span>
+        </button>
+      )}
     </div>
   );
 }
