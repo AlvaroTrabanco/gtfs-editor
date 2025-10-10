@@ -14,7 +14,10 @@ import PatternMatrix from "./PatternMatrix";
 /** ---------- Misc ---------- */
 const defaultTZ: string = String(Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Madrid");
 const MIN_ADD_ZOOM = 15;
-const DIM_ROUTE_COLOR = "#2b2b2b"; // single gray for all non-selected routes
+const MIN_STOP_ZOOM = 11;
+const MIN_ROUTE_ZOOM = 6;      // ← NEW: don’t draw route lines when zoomed way out
+const MAX_ROUTE_POINTS = 2000; // ← NEW: cap points per polyline drawn to the screen
+const DIM_ROUTE_COLOR = "#2b2b2b";
 
 
 /** ---------- Types ---------- */
@@ -180,6 +183,24 @@ function DrawShapeOnClick({ onPoint, onFinish }: { onPoint: (latlng: { lat: numb
   return null;
 }
 
+function MapStateTracker({ onChange }: { onChange: (z: number, b: L.LatLngBounds) => void }) {
+  const map = useMap();
+
+  useEffect(() => {
+    const emit = () => onChange(map.getZoom(), map.getBounds());
+    emit(); // initial
+    map.on("moveend", emit);
+    map.on("zoomend", emit);
+    return () => {
+      map.off("moveend", emit);
+      map.off("zoomend", emit);
+    };
+  }, [map, onChange]); // onChange is memoized (useCallback), so this won't loop
+
+  return null;
+}
+
+
 /** ---------- Advanced filter parsing ---------- */
 function looksAdvanced(q: string) { return /(&&|\|\||==|!=|>=|<=|>|<|~=|!~=)/.test(q); }
 function tryNumber(v: string) { const n = Number(v); return Number.isFinite(n) ? n : null; }
@@ -279,6 +300,8 @@ function PaginatedEditableTable<T extends Record<string, any>>({
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<5|10|20|50|100>(initialPageSize);
   const [query, setQuery] = useState("");
+
+  
 
   useEffect(() => { setQuery(""); setPage(1); }, [clearSignal]);
 
@@ -496,6 +519,22 @@ export default function App() {
     }));
   }, []);
 
+
+  useEffect(() => {
+    const onErr = (ev: ErrorEvent) => {
+      console.error("GLOBAL ERROR:", ev.error ?? ev.message);
+    };
+    const onRej = (ev: PromiseRejectionEvent) => {
+      console.error("UNHANDLED REJECTION:", ev.reason);
+    };
+    window.addEventListener("error", onErr);
+    window.addEventListener("unhandledrejection", onRej);
+    return () => {
+      window.removeEventListener("error", onErr);
+      window.removeEventListener("unhandledrejection", onRej);
+    };
+  }, []);
+
   /** Leaflet icons */
   useEffect(() => {
     // @ts-ignore
@@ -530,14 +569,31 @@ export default function App() {
   const [drawMode, setDrawMode] = useState(false);
   const [nextStopName, setNextStopName] = useState<string>("");
   const [showRoutes, setShowRoutes] = useState<boolean>(true);
+
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
   const [selectedRouteIds, setSelectedRouteIds] = useState<Set<string>>(new Set()); // NEW multi-select
   const [selectedStopId, setSelectedStopId] = useState<string | null>(null);
 
-  /** Busy / thinking button */
-  const [busy, setBusy] = useState<{ on: boolean; label: string }>({ on: false, label: "" });
-  const startBusy = (label: string) => setBusy({ on: true, label });
-  const stopBusy  = () => setBusy({ on: false, label: "" });
+
+  // Map state for culling heavy layers
+  const [mapZoom, setMapZoom] = useState(6);
+  const [mapBounds, setMapBounds] = useState<L.LatLngBounds | null>(null);
+
+  // Stable callback so MapStateTracker's effect doesn't re-run forever
+  const onMapState = useCallback((z: number, b: L.LatLngBounds) => {
+    setMapZoom(prev => (prev === z ? prev : z));
+    setMapBounds(prev => (prev && prev.equals(b) ? prev : b));
+  }, []);
+
+  // Only draw stops that are in view and when zoomed in enough
+  const visibleStops = useMemo(() => {
+    if (!mapBounds || mapZoom < MIN_STOP_ZOOM) return [];
+    const b = mapBounds;
+    return stops.filter(s => b.contains(L.latLng(s.stop_lat, s.stop_lon)));
+  }, [stops, mapBounds, mapZoom]);
+
+
+
 
   /** Filters / clearing */
   const [activeServiceIds, setActiveServiceIds] = useState<Set<string>>(new Set());
@@ -618,11 +674,11 @@ export default function App() {
           project: { extras: { restrictions: project?.extras?.restrictions ?? {} } },
         };
         const json = JSON.stringify(snapshot);
-        if (json.length < 5_000_000) {
-          localStorage.setItem(STORAGE_KEY, json);
-        } else {
+        if (json.length >= 5_000_000) {
           console.warn("Skipping autosave: feed too large for localStorage");
+          return;
         }
+        localStorage.setItem(STORAGE_KEY, json);
       } catch (err) {
         console.warn("LocalStorage save failed:", err);
       }
@@ -651,43 +707,40 @@ export default function App() {
     const blob = new Blob([JSON.stringify({ agencies, stops, routes, services, trips, stopTimes, shapePts }, null, 2)], { type: "application/json" });
     saveAs(blob, "project.json");
   };
-  const importProject = async (file: File) => {
-    try {
-      const obj = JSON.parse(await file.text());
+  const importProject = async (file: File) =>
+    withBusy("Loading project…", async () => {
+      try {
+        const obj = JSON.parse(await file.text());
 
-      startBusy("Loading project…");
-      suppressPersist.current = true;
+        suppressPersist.current = true;
 
-      setAgencies(obj.agencies ?? []);
-      setStops((obj.stops ?? []).map((s: any) => ({ uid: s.uid || uuidv4(), ...s })));
-      setRoutes(obj.routes ?? []);
-      setServices(obj.services ?? []);
-      setTrips(obj.trips ?? []);
-      setStopTimes(obj.stopTimes ?? []);
-      setShapePts(obj.shapePts ?? []);
+        setAgencies(obj.agencies ?? []);
+        setStops((obj.stops ?? []).map((s: any) => ({ uid: s.uid || uuidv4(), ...s })));
+        setRoutes(obj.routes ?? []);
+        setServices(obj.services ?? []);
+        setTrips(obj.trips ?? []);
+        setStopTimes(obj.stopTimes ?? []);
+        setShapePts(obj.shapePts ?? []);
 
-      // restore rules
-      const savedRules =
-        obj.project?.extras?.restrictions ??
-        obj.extras?.restrictions ??
-        obj.restrictions ?? {};
-      setProject((prev: any) => ({
-        ...(prev ?? {}),
-        extras: { ...(prev?.extras ?? {}), restrictions: savedRules },
-      }));
+        // restore rules
+        const savedRules =
+          obj.project?.extras?.restrictions ??
+          obj.extras?.restrictions ??
+          obj.restrictions ?? {};
+        setProject((prev: any) => ({
+          ...(prev ?? {}),
+          extras: { ...(prev?.extras ?? {}), restrictions: savedRules },
+        }));
 
-      setBanner({ kind: "success", text: "Project imported." });
-      setTimeout(() => setBanner(null), 2200);
+        setBanner({ kind: "success", text: "Project imported." });
+        setTimeout(() => setBanner(null), 2200);
 
-      // resume autosave after paint
-      queueMicrotask(() => { suppressPersist.current = false; });
-    } catch {
-      setBanner({ kind: "error", text: "Invalid project JSON." });
-      setTimeout(() => setBanner(null), 3200);
-    } finally {
-      stopBusy();
-    }
-  };
+        queueMicrotask(() => { suppressPersist.current = false; });
+      } catch {
+        setBanner({ kind: "error", text: "Invalid project JSON." });
+        setTimeout(() => setBanner(null), 3200);
+      }
+    });
 
   const importOverrides = async (file: File) => {
     try {
@@ -734,92 +787,90 @@ export default function App() {
   };
 
   /** Import GTFS .zip */
-  const importGTFSZip = async (file: File) => {
-    try {
-      startBusy("Parsing GTFS…");
-      suppressPersist.current = true;
+  const importGTFSZip = async (file: File) =>
+    withBusy("Parsing GTFS…", async () => {
+      try {
+        suppressPersist.current = true;
 
-      const zip = await JSZip.loadAsync(file);
-      const tables: Record<string, string> = {};
-      for (const entry of Object.values(zip.files)) {
-        const f = entry as any;
-        if (f.dir) continue;
-        if (!f.name?.toLowerCase().endsWith(".txt")) continue;
-        tables[f.name.replace(/\.txt$/i, "")] = await f.async("string");
-      }
-      const parse = (text: string) =>
-        (Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true }).data as any[]) || [];
+        const zip = await JSZip.loadAsync(file);
+        const tables: Record<string, string> = {};
+        for (const entry of Object.values(zip.files)) {
+          const f = entry as any;
+          if (f.dir) continue;
+          if (!f.name?.toLowerCase().endsWith(".txt")) continue;
+          tables[f.name.replace(/\.txt$/i, "")] = await f.async("string");
+        }
+        const parse = (text: string) =>
+          (Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true }).data as any[]) || [];
 
-      if (tables["agency"]) {
-        setAgencies(parse(tables["agency"]).map((r: any) => ({
-          agency_id: String(r.agency_id ?? ""), agency_name: String(r.agency_name ?? ""),
-          agency_url: String(r.agency_url ?? ""), agency_timezone: String(r.agency_timezone ?? defaultTZ)
-        })));
-      }
-      if (tables["stops"]) {
-        setStops(parse(tables["stops"]).map((r: any) => ({
-          uid: uuidv4(),
-          stop_id: String(r.stop_id ?? ""), stop_name: String(r.stop_name ?? ""),
-          stop_lat: Number(r.stop_lat ?? r.stop_latitude ?? r.lat ?? 0),
-          stop_lon: Number(r.stop_lon ?? r.stop_longitude ?? r.lon ?? 0),
-        })));
-      }
-      if (tables["routes"]) {
-        setRoutes(parse(tables["routes"]).map((r: any) => ({
-          route_id: String(r.route_id ?? ""), route_short_name: String(r.route_short_name ?? ""),
-          route_long_name: String(r.route_long_name ?? ""), route_type: Number(r.route_type ?? 3),
-          agency_id: String(r.agency_id ?? ""),
-        })));
-      }
-      if (tables["calendar"]) {
-        setServices(parse(tables["calendar"]).map((r: any) => ({
-          service_id: String(r.service_id ?? ""),
-          monday: Number(r.monday ?? 0), tuesday: Number(r.tuesday ?? 0), wednesday: Number(r.wednesday ?? 0),
-          thursday: Number(r.thursday ?? 0), friday: Number(r.friday ?? 0), saturday: Number(r.saturday ?? 0), sunday: Number(r.sunday ?? 0),
-          start_date: String(r.start_date ?? ""), end_date: String(r.end_date ?? ""),
-        })));
-      }
-      if (tables["trips"]) {
-        setTrips(parse(tables["trips"]).map((r: any) => ({
-          route_id: String(r.route_id ?? ""),
-          service_id: String(r.service_id ?? ""),
-          trip_id: String(r.trip_id ?? ""),
-          trip_headsign: r.trip_headsign != null ? String(r.trip_headsign) : undefined,
-          shape_id: r.shape_id != null ? String(r.shape_id) : undefined,
-          direction_id: r.direction_id != null && r.direction_id !== "" ? Number(r.direction_id) : undefined,
-        })));
-      }
-      if (tables["stop_times"]) {
-        setStopTimes(parse(tables["stop_times"]).map((r: any) => ({
-          trip_id: String(r.trip_id ?? ""),
-          arrival_time: String(r.arrival_time ?? ""),
-          departure_time: String(r.departure_time ?? ""),
-          stop_id: String(r.stop_id ?? ""),
-          stop_sequence: Number(r.stop_sequence ?? 0),
-          pickup_type: r.pickup_type != null && r.pickup_type !== "" ? Number(r.pickup_type) : undefined,
-          drop_off_type: r.drop_off_type != null && r.drop_off_type !== "" ? Number(r.drop_off_type) : undefined,
-        })));
-      }
-      if (tables["shapes"]) {
-        setShapePts(parse(tables["shapes"]).map((r: any) => ({
-          shape_id: String(r.shape_id ?? ""),
-          lat: Number(r.shape_pt_lat ?? r.lat ?? 0), lon: Number(r.shape_pt_lon ?? r.lon ?? 0),
-          seq: Number(r.shape_pt_sequence ?? r.seq ?? 0),
-        })));
-      }
+        if (tables["agency"]) {
+          setAgencies(parse(tables["agency"]).map((r: any) => ({
+            agency_id: String(r.agency_id ?? ""), agency_name: String(r.agency_name ?? ""),
+            agency_url: String(r.agency_url ?? ""), agency_timezone: String(r.agency_timezone ?? defaultTZ)
+          })));
+        }
+        if (tables["stops"]) {
+          setStops(parse(tables["stops"]).map((r: any) => ({
+            uid: uuidv4(),
+            stop_id: String(r.stop_id ?? ""), stop_name: String(r.stop_name ?? ""),
+            stop_lat: Number(r.stop_lat ?? r.stop_latitude ?? r.lat ?? 0),
+            stop_lon: Number(r.stop_lon ?? r.stop_longitude ?? r.lon ?? 0),
+          })));
+        }
+        if (tables["routes"]) {
+          setRoutes(parse(tables["routes"]).map((r: any) => ({
+            route_id: String(r.route_id ?? ""), route_short_name: String(r.route_short_name ?? ""),
+            route_long_name: String(r.route_long_name ?? ""), route_type: Number(r.route_type ?? 3),
+            agency_id: String(r.agency_id ?? ""),
+          })));
+        }
+        if (tables["calendar"]) {
+          setServices(parse(tables["calendar"]).map((r: any) => ({
+            service_id: String(r.service_id ?? ""),
+            monday: Number(r.monday ?? 0), tuesday: Number(r.tuesday ?? 0), wednesday: Number(r.wednesday ?? 0),
+            thursday: Number(r.thursday ?? 0), friday: Number(r.friday ?? 0), saturday: Number(r.saturday ?? 0), sunday: Number(r.sunday ?? 0),
+            start_date: String(r.start_date ?? ""), end_date: String(r.end_date ?? ""),
+          })));
+        }
+        if (tables["trips"]) {
+          setTrips(parse(tables["trips"]).map((r: any) => ({
+            route_id: String(r.route_id ?? ""),
+            service_id: String(r.service_id ?? ""),
+            trip_id: String(r.trip_id ?? ""),
+            trip_headsign: r.trip_headsign != null ? String(r.trip_headsign) : undefined,
+            shape_id: r.shape_id != null ? String(r.shape_id) : undefined,
+            direction_id: r.direction_id != null && r.direction_id !== "" ? Number(r.direction_id) : undefined,
+          })));
+        }
+        if (tables["stop_times"]) {
+          setStopTimes(parse(tables["stop_times"]).map((r: any) => ({
+            trip_id: String(r.trip_id ?? ""),
+            arrival_time: String(r.arrival_time ?? ""),
+            departure_time: String(r.departure_time ?? ""),
+            stop_id: String(r.stop_id ?? ""),
+            stop_sequence: Number(r.stop_sequence ?? 0),
+            pickup_type: r.pickup_type != null && r.pickup_type !== "" ? Number(r.pickup_type) : undefined,
+            drop_off_type: r.drop_off_type != null && r.drop_off_type !== "" ? Number(r.drop_off_type) : undefined,
+          })));
+        }
+        if (tables["shapes"]) {
+          setShapePts(parse(tables["shapes"]).map((r: any) => ({
+            shape_id: String(r.shape_id ?? ""),
+            lat: Number(r.shape_pt_lat ?? r.lat ?? 0), lon: Number(r.shape_pt_lon ?? r.lon ?? 0),
+            seq: Number(r.shape_pt_sequence ?? r.seq ?? 0),
+          })));
+        }
 
-      setBanner({ kind: "success", text: "GTFS zip imported." });
-      setTimeout(() => setBanner(null), 2200);
+        setBanner({ kind: "success", text: "GTFS zip imported." });
+        setTimeout(() => setBanner(null), 2200);
 
-      queueMicrotask(() => { suppressPersist.current = false; });
-    } catch (e) {
-      console.error(e);
-      setBanner({ kind: "error", text: "Failed to import GTFS zip." });
-      setTimeout(() => setBanner(null), 3200);
-    } finally {
-      stopBusy();
-    }
-  };
+        queueMicrotask(() => { suppressPersist.current = false; });
+      } catch (e) {
+        console.error(e);
+        setBanner({ kind: "error", text: "Failed to import GTFS zip." });
+        setTimeout(() => setBanner(null), 3200);
+      }
+    });
 
   /** ---------- Derived maps for map drawing ---------- */
   const stopsById = useMemo(() => {
@@ -861,40 +912,64 @@ export default function App() {
   }, [trips]);
 
   const routePolylines = useMemo(() => {
-    if (isBusy) return new Map<string, [number, number][]>();
+    // Don’t compute during busy work or when zoomed far out / no bounds yet
+    if (isBusy || !mapBounds || mapZoom < MIN_ROUTE_ZOOM) return new Map<string, [number, number][]>();
+
     const out = new Map<string, [number, number][]>();
+    const b = mapBounds;
+
+    // Helper: keep at most MAX_ROUTE_POINTS by picking every k-th point
+    const decimate = (coords: [number, number][]) => {
+      const n = coords.length;
+      if (n <= MAX_ROUTE_POINTS) return coords;
+      const step = Math.ceil(n / MAX_ROUTE_POINTS);
+      const slim: [number, number][] = [];
+      for (let i = 0; i < n; i += step) slim.push(coords[i]);
+      // ensure last point is included
+      if (slim[slim.length - 1] !== coords[n - 1]) slim.push(coords[n - 1]);
+      return slim;
+    };
 
     for (const r of routes) {
       const rTrips = tripsByRoute.get(r.route_id) ?? [];
 
-      // Try shapes
-      let bestShape: [number, number][] | null = null;
+      // Pick the longest available SHAPE
+      let coords: [number, number][] | null = null;
       for (const t of rTrips) {
         if (!t.shape_id) continue;
         const pts = shapesById.get(t.shape_id);
         if (!pts || pts.length < 2) continue;
-        const coords = pts.map(p => [p.lat, p.lon] as [number, number]);
-        if (!bestShape || coords.length > bestShape.length) bestShape = coords;
+        const c = pts.map(p => [p.lat, p.lon] as [number, number]);
+        if (!coords || c.length > coords.length) coords = c;
       }
-      if (bestShape) { out.set(r.route_id, bestShape); continue; }
 
-      // Fallback: first trip with stop_times
-      let fallback: [number, number][] | null = null;
-      for (const t of rTrips) {
-        const sts = stopTimesByTrip.get(t.trip_id);
-        if (!sts || sts.length < 2) continue;
-        const coords: [number, number][] = [];
-        for (const st of sts) {
-          const s = stopsById.get(st.stop_id);
-          if (s) coords.push([s.stop_lat, s.stop_lon]);
+      // Fallback: derive from the first trip’s stop_times if no shape available
+      if (!coords) {
+        for (const t of rTrips) {
+          const sts = stopTimesByTrip.get(t.trip_id);
+          if (!sts || sts.length < 2) continue;
+          const c: [number, number][] = [];
+          for (const st of sts) {
+            const s = stopsById.get(st.stop_id);
+            if (s) c.push([s.stop_lat, s.stop_lon]);
+          }
+          if (c.length >= 2) { coords = c; break; }
         }
-        if (coords.length >= 2) { fallback = coords; break; }
       }
-      if (fallback) out.set(r.route_id, fallback);
+
+      if (!coords || coords.length < 2) continue;
+
+      // Quick bounds check: keep the route only if any segment lies in (or near) the current view.
+      // We’ll do a cheap test by checking whether at least one vertex is inside bounds.
+      const anyInside = coords.some(([lat, lon]) => b.contains(L.latLng(lat, lon)));
+      if (!anyInside) continue;
+
+      out.set(r.route_id, decimate(coords));
     }
 
     return out;
-  }, [isBusy, routes, tripsByRoute, shapesById, stopTimesByTrip, stopsById]);
+    // NOTE we now depend on mapBounds/mapZoom to cull by view
+  }, [isBusy, mapBounds, mapZoom, routes, tripsByRoute, shapesById, stopTimesByTrip, stopsById]);
 
   /** ---------- Selection & ordering ---------- */
   // Visual: selected route first
@@ -980,16 +1055,12 @@ export default function App() {
     return res;
   };
 
-  const onExportGTFS = async () => {
-    startBusy("Preparing GTFS…");
-    try {
+  const onExportGTFS = async () =>
+    withBusy("Preparing GTFS…", async () => {
       const { errors } = runValidation();
       if (errors.length) { alert("Fix validation errors before exporting."); return; }
       await exportGTFSZip({ agencies, stops, routes, services, trips, stopTimes, shapePts });
-    } finally {
-      stopBusy();
-    }
-  };
+    });
 
   const resetAll = () => {
     if (!confirm("Reset project?")) return;
@@ -1066,13 +1137,70 @@ export default function App() {
         setRoutes(prev => prev.filter(r => r.route_id !== route_id));
 
         // selection cleanup with busy guard already active
-        setSelectedRouteIds(prev => { const n = new Set(prev); n.delete(route_id); return n; });
+        setSelectedRouteIds((prev: Set<string>) => { const n = new Set(prev); n.delete(route_id); return n; });
         if (selectedRouteId === route_id) setSelectedRouteId(null);
       });
     } catch (e) {
       console.error(e);
       setBanner({ kind: "error", text: "Delete failed. Try again." });
       setTimeout(() => setBanner(null), 3000);
+    }
+  };
+
+    /** Bulk delete routes in ONE pass (prevents thrash & crashes) */
+  const hardDeleteRoutesBulk = (routeIds: Set<string>) => {
+    if (!routeIds.size) return;
+
+    try {
+      suppressPersist.current = true; // avoid autosave thrash while we compute
+
+      const doomedRoutes = new Set(routeIds);
+      const doomedTrips = new Set(
+        trips.filter(t => doomedRoutes.has(t.route_id)).map(t => t.trip_id)
+      );
+
+      // Pre-compute “next” snapshots once
+      const remainingTrips = trips.filter(t => !doomedRoutes.has(t.route_id));
+      const keptShapeIds = new Set(
+        remainingTrips.map(t => t.shape_id).filter(Boolean) as string[]
+      );
+
+      const nextRoutes = routes.filter(r => !doomedRoutes.has(r.route_id));
+      const nextStopTimes = stopTimes.filter(st => !doomedTrips.has(st.trip_id));
+      const nextShapePts = shapePts.filter(p => keptShapeIds.has(p.shape_id));
+
+      // Prune OD restrictions for deleted trips
+      const nextRestrictions = (() => {
+        const curr: Record<string, any> = project?.extras?.restrictions ?? {};
+        const out: Record<string, any> = {};
+        for (const [k, v] of Object.entries(curr)) {
+          const [trip_id] = k.split("::");
+          if (!doomedTrips.has(trip_id)) out[k] = v;
+        }
+        return out;
+      })();
+
+      unstable_batchedUpdates(() => {
+        setProject((prev: any) => ({
+          ...(prev ?? {}),
+          extras: { ...(prev?.extras ?? {}), restrictions: nextRestrictions },
+        }));;
+        setTrips(remainingTrips);
+        setStopTimes(nextStopTimes);
+        setShapePts(nextShapePts);
+        setRoutes(nextRoutes);
+
+        // Clear selections that reference deleted routes
+        setSelectedRouteIds(new Set());
+        if (selectedRouteId && doomedRoutes.has(selectedRouteId)) setSelectedRouteId(null);
+      });
+    } catch (e) {
+      console.error(e);
+      setBanner({ kind: "error", text: "Bulk delete failed. Try again." });
+      setTimeout(() => setBanner(null), 3000);
+    } finally {
+      // resume autosave after paint
+      queueMicrotask(() => { suppressPersist.current = false; });
     }
   };
 
@@ -1261,6 +1389,7 @@ export default function App() {
   }
 
   /** ---------- Render ---------- */
+  const tooManyRoutes = routes.length > 1200; // tweak as needed
   return (
     <div className="container" style={{ padding: 16 }}>
       <style>{`.busy-fab {
@@ -1336,17 +1465,8 @@ export default function App() {
                 onClick={() =>
                   withBusy(`Deleting ${selectedRouteIds.size} route(s)…`, async () => {
                     if (!confirm(`Delete ${selectedRouteIds.size} route(s)?`)) return;
-
-                    // delete sequentially to avoid thrashing; yield a tick between each
-                    for (const rid of Array.from(selectedRouteIds)) {
-                      hardDeleteRoute(rid);
-                      // let React flush state; keeps UI responsive on big feeds
-                      await Promise.resolve();
-                    }
-
-                    // clear selection after deletion
-                    setSelectedRouteIds(new Set());
-                    setSelectedRouteId(null);
+                    // Single-pass bulk delete (no per-route loop)
+                    hardDeleteRoutesBulk(selectedRouteIds);
                   })
                 }
               >
@@ -1434,9 +1554,8 @@ export default function App() {
 
           <button
             className="btn"
-            onClick={async () => {
-              startBusy("Validating…");
-              try {
+            onClick={() =>
+              withBusy("Validating…", async () => {
                 const res = runValidation();
                 setValidation(res);
                 setBanner(
@@ -1445,10 +1564,8 @@ export default function App() {
                     : { kind: "success", text: res.warnings.length ? `Validation OK with ${res.warnings.length} warnings.` : "Validation OK." }
                 );
                 setTimeout(() => setBanner(null), 3200);
-              } finally {
-                stopBusy();
-              }
-            }}
+              })
+            }
           >
             Validate
           </button>
@@ -1475,15 +1592,17 @@ export default function App() {
                 </div>
               </div>
             )}
-            <MapContainer center={[40.4168, -3.7038]} zoom={6} style={{ height: "100%", width: "100%" }}>
+            <MapContainer center={[40.4168, -3.7038]} zoom={6} preferCanvas={true} style={{ height: "100%", width: "100%" }}>
               <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="© OpenStreetMap contributors" />
               <Pane name="routeHalo" style={{ zIndex: 390 }} />
               <Pane name="routeLines" style={{ zIndex: 400 }} />
               <Pane name="stopsTop"  style={{ zIndex: 650 }} />
+              <MapStateTracker onChange={onMapState} />
+
               {!drawMode && <AddStopOnClick onAdd={addStopFromMap} onTooFar={() => setBanner({ kind: "info", text: `Zoom in to at least ${MIN_ADD_ZOOM} to add stops.` })} />}
               {drawMode && <DrawShapeOnClick onPoint={() => {}} onFinish={() => setDrawMode(false)} />}
 
-              {stops.map(s => (
+              {visibleStops.map(s => (
                 <CircleMarker
                   key={s.uid}
                   center={[s.stop_lat, s.stop_lon]}
@@ -1497,7 +1616,7 @@ export default function App() {
                 />
               ))}
 
-              {Array.from(routePolylines.entries()).map(([route_id, coords]) => {
+              {!tooManyRoutes && Array.from(routePolylines.entries()).map(([route_id, coords]) => {
                 const isSel = selectedRouteId === route_id || selectedRouteIds.has(route_id);
                 const hasSel = !!selectedRouteId || selectedRouteIds.size > 0;
                 const color   = hasSel ? (isSel ? routeColor(route_id) : DIM_ROUTE_COLOR) : routeColor(route_id);
@@ -1541,7 +1660,7 @@ export default function App() {
           const rid = (row as RouteRow).route_id;
           const meta = (e.metaKey || e.ctrlKey);
           if (meta) {
-            setSelectedRouteIds(prev => {
+            setSelectedRouteIds((prev: Set<string>) => {
               const next = new Set(prev);
               next.has(rid) ? next.delete(rid) : next.add(rid);
               if (next.size === 1) setSelectedRouteId(rid);
@@ -1560,13 +1679,15 @@ export default function App() {
         clearSignal={clearSignal}
         onIconClick={(r) => {
           const rid = (r as RouteRow).route_id;
-          setSelectedRouteIds(prev => { const n = new Set(prev); n.delete(rid); return n; });
+          setSelectedRouteIds((prev: Set<string>) => { const n = new Set(prev); n.delete(rid); return n; });
           if (selectedRouteId === rid) setSelectedRouteId(null);
         }}
         selectOnCellFocus
         onDeleteRow={(r) => {
           const rid = (r as RouteRow).route_id;
-          if (confirm(`Delete route ${rid}?`)) hardDeleteRoute(rid);
+          if (!rid) return;
+          if (!confirm(`Delete route ${rid}?`)) return;
+          hardDeleteRoutesBulk(new Set([rid]));
         }}
         enableMultiSelect
       />
@@ -1586,7 +1707,7 @@ export default function App() {
                   svc={sid}
                   active={active}
                   onToggle={() => {
-                    setActiveServiceIds(prev => {
+                    setActiveServiceIds((prev: Set<string>) => {
                       const next = new Set(prev);
                       if (next.has(sid)) next.delete(sid); else next.add(sid);
                       return next;
@@ -1746,10 +1867,10 @@ export default function App() {
           </p>
         </div>
       </div>
-      {busy.on && (
-        <button className="busy-fab" aria-busy="true" title={busy.label}>
+      {isBusy && (
+        <button className="busy-fab" aria-busy="true" title={busyLabel ?? "Working…"}>
           <span className="spinner" />
-          <span>{busy.label}</span>
+          <span>{busyLabel ?? "Working…"}</span>
         </button>
       )}
     </div>
