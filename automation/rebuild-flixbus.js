@@ -185,11 +185,14 @@ function compileTripsWithOD({ trips, stop_times }, restrictions) {
 
     const zip = await JSZip.loadAsync(buf);
     const tables = {};
+    const raw = {};
     for (const entry of Object.values(zip.files)) {
       const f = entry;
       if (f.dir) continue;
       if (!f.name?.toLowerCase().endsWith(".txt")) continue;
-      tables[f.name.replace(/\.txt$/i, "")] = await f.async("string");
+      const base = f.name.replace(/\.txt$/i, "");
+      tables[base] = await f.async("string");
+      raw[base] = await f.async("uint8array");
     }
 
     // parse needed tables
@@ -236,9 +239,9 @@ function compileTripsWithOD({ trips, stop_times }, restrictions) {
     if (stops.length)    outZip.file("stops.txt",  csvify(stops, ["stop_id","stop_name","stop_lat","stop_lon"]));
     if (routes.length)   outZip.file("routes.txt", csvify(routes, ["route_id","route_short_name","route_long_name","route_type","agency_id"]));
     if (services.length) outZip.file("calendar.txt", csvify(services, ["service_id","monday","tuesday","wednesday","thursday","friday","saturday","sunday","start_date","end_date"]));
-    if (shapes.length)   outZip.file("shapes.txt", csvify(shapes.map(p => ({
-      shape_id: p.shape_id, shape_pt_lat: p.shape_pt_lat ?? p.lat, shape_pt_lon: p.shape_pt_lon ?? p.lon, shape_pt_sequence: p.shape_pt_sequence ?? p.seq
-    })), ["shape_id","shape_pt_lat","shape_pt_lon","shape_pt_sequence"]));
+  
+    // Passthrough shapes untouched to avoid massive text output and keep vendor formatting.
+    if (raw.shapes)      outZip.file("shapes.txt", raw.shapes, { binary: true });
 
     // compiled trips + stop_times
     outZip.file("trips.txt", csvify(outTrips.map(tr => ({
@@ -256,7 +259,12 @@ function compileTripsWithOD({ trips, stop_times }, restrictions) {
       drop_off_type: st.drop_off_type ?? 0
     })), ["trip_id","arrival_time","departure_time","stop_id","stop_sequence","pickup_type","drop_off_type"]));
 
-    const blob = await outZip.generateAsync({ type: "nodebuffer" });
+    const blob = await outZip.generateAsync({
+      type: "nodebuffer",
+      compression: "DEFLATE",
+      compressionOptions: { level: 9 } // max compression
+    });
+
     const outPath = path.join(OUT_DIR, OUT_ZIP);
     await fs.writeFile(outPath, blob);
     console.log("Wrote:", outPath);
