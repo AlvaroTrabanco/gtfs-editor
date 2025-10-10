@@ -132,31 +132,149 @@ function toHHMMSS(s?: string | null) {
 }
 
 /** ---------- Export GTFS (zip) ---------- */
+/** ---------- Export GTFS (zip, slim + compressed) ---------- */
 async function exportGTFSZip(payload: {
   agencies: Agency[]; stops: Stop[]; routes: RouteRow[]; services: Service[];
   trips: Trip[]; stopTimes: StopTime[]; shapePts: ShapePt[];
+}, opts?: {
+  onlyRoutes?: Set<string>;     // if provided, export only these route_ids (and their deps)
+  pruneUnused?: boolean;        // default true
+  roundCoords?: boolean;        // default true
+  decimateShapes?: boolean;     // default true
+  maxShapePts?: number;         // hard cap per shape after decimation (default 2000)
 }) {
+  const {
+    onlyRoutes,
+    pruneUnused = true,
+    roundCoords = true,
+    decimateShapes = true,
+    maxShapePts = 2000,
+  } = (opts ?? {});
+
+  // 1) Start from payload; optionally filter to selected routes
+  const baseRoutes = onlyRoutes
+    ? payload.routes.filter(r => onlyRoutes.has(r.route_id))
+    : payload.routes.slice();
+
+  // Quick maps for lookup
+  const tripsByRoute = new Map<string, Trip[]>();
+  for (const t of payload.trips) {
+    if (!tripsByRoute.has(t.route_id)) tripsByRoute.set(t.route_id, []);
+    tripsByRoute.get(t.route_id)!.push(t);
+  }
+
+  const stopTimesByTrip = new Map<string, StopTime[]>();
+  for (const st of payload.stopTimes) {
+    if (!stopTimesByTrip.has(st.trip_id)) stopTimesByTrip.set(st.trip_id, []);
+    stopTimesByTrip.get(st.trip_id)!.push(st);
+  }
+
+  // 2) Build reachability sets from the chosen routes
+  const keepRouteIds = new Set(baseRoutes.map(r => r.route_id));
+  const keepTripIds  = new Set<string>();
+  const keepStopIds  = new Set<string>();
+  const keepSvcIds   = new Set<string>();
+  const keepShapeIds = new Set<string>();
+
+  for (const r of baseRoutes) {
+    const rTrips = tripsByRoute.get(r.route_id) ?? [];
+    for (const t of rTrips) {
+      keepTripIds.add(t.trip_id);
+      if (t.service_id) keepSvcIds.add(t.service_id);
+      if (t.shape_id) keepShapeIds.add(t.shape_id);
+
+      const sts = stopTimesByTrip.get(t.trip_id) ?? [];
+      for (const st of sts) {
+        if (!((st.arrival_time?.trim()) || (st.departure_time?.trim()))) continue; // skip blank rows
+        keepStopIds.add(st.stop_id);
+      }
+    }
+  }
+
+  // 3) Prune if requested
+  const agenciesOut = payload.agencies.length ? payload.agencies.slice() : [{
+    agency_id: "agency_1",
+    agency_name: "Agency",
+    agency_url: "https://example.com",
+    agency_timezone: defaultTZ,
+  }];
+
+  const routesOut = baseRoutes;
+  const tripsOut  = pruneUnused
+    ? payload.trips.filter(t => keepTripIds.has(t.trip_id))
+    : payload.trips.slice();
+
+  const stopTimesOut = (pruneUnused
+    ? payload.stopTimes.filter(st => keepTripIds.has(st.trip_id))
+    : payload.stopTimes.slice()
+  ).filter(st => !!(st.arrival_time?.trim() || st.departure_time?.trim())); // also strip fully-blank rows
+
+  const stopsOut = pruneUnused
+    ? payload.stops.filter(s => keepStopIds.has(s.stop_id))
+    : payload.stops.slice();
+
+  const servicesOut = pruneUnused
+    ? payload.services.filter(s => keepSvcIds.has(s.service_id))
+    : payload.services.slice();
+
+  // 4) Shapes: filter + shrink
+  let shapesOut = pruneUnused
+    ? payload.shapePts.filter(p => keepShapeIds.has(p.shape_id))
+    : payload.shapePts.slice();
+
+  if (roundCoords) {
+    const round5 = (x: number) => Math.round(x * 1e5) / 1e5; // ~1.1 m
+    shapesOut = shapesOut.map(p => ({ ...p, lat: round5(p.lat), lon: round5(p.lon) }));
+  }
+
+  if (decimateShapes) {
+    const groups = new Map<string, ShapePt[]>();
+    for (const p of shapesOut) {
+      if (!groups.has(p.shape_id)) groups.set(p.shape_id, []);
+      groups.get(p.shape_id)!.push(p);
+    }
+    const slim: ShapePt[] = [];
+    for (const [sid, arr] of groups) {
+      const sorted = arr.slice().sort((a,b)=>a.seq-b.seq);
+      if (sorted.length <= maxShapePts) {
+        slim.push(...sorted);
+      } else {
+        const step = Math.ceil(sorted.length / maxShapePts);
+        for (let i = 0; i < sorted.length; i += step) slim.push(sorted[i]);
+        const last = sorted[sorted.length - 1];
+        const packedLast = slim[slim.length - 1];
+        if (!packedLast || packedLast.seq !== last.seq) slim.push(last);
+      }
+    }
+    shapesOut = slim;
+  }
+
+  // 5) Build CSVs
   const zip = new JSZip();
 
-  const filteredStopTimes = payload.stopTimes.filter(
-    st => !!(st.arrival_time?.trim() || st.departure_time?.trim())
-  );
-
-  zip.file("agency.txt", csvify(payload.agencies, ["agency_id","agency_name","agency_url","agency_timezone"]));
+  zip.file("agency.txt", csvify(agenciesOut, ["agency_id","agency_name","agency_url","agency_timezone"]));
   zip.file("stops.txt", csvify(
-    payload.stops.map(s => ({ stop_id: s.stop_id, stop_name: s.stop_name, stop_lat: s.stop_lat, stop_lon: s.stop_lon })),
+    stopsOut.map(s => ({ stop_id: s.stop_id, stop_name: s.stop_name, stop_lat: s.stop_lat, stop_lon: s.stop_lon })),
     ["stop_id","stop_name","stop_lat","stop_lon"]
   ));
-  zip.file("routes.txt", csvify(payload.routes, ["route_id","route_short_name","route_long_name","route_type","agency_id"]));
-  zip.file("calendar.txt", csvify(payload.services, ["service_id","monday","tuesday","wednesday","thursday","friday","saturday","sunday","start_date","end_date"]));
-  zip.file("trips.txt", csvify(payload.trips, ["route_id","service_id","trip_id","trip_headsign","shape_id","direction_id"]));
-  zip.file("stop_times.txt", csvify(filteredStopTimes, ["trip_id","arrival_time","departure_time","stop_id","stop_sequence"]));
-  zip.file("shapes.txt", csvify(
-    payload.shapePts.map(p => ({ shape_id: p.shape_id, shape_pt_lat: p.lat, shape_pt_lon: p.lon, shape_pt_sequence: p.seq })),
-    ["shape_id","shape_pt_lat","shape_pt_lon","shape_pt_sequence"]
-  ));
+  zip.file("routes.txt", csvify(routesOut, ["route_id","route_short_name","route_long_name","route_type","agency_id"]));
+  zip.file("calendar.txt", csvify(servicesOut, ["service_id","monday","tuesday","wednesday","thursday","friday","saturday","sunday","start_date","end_date"]));
+  zip.file("trips.txt", csvify(tripsOut, ["route_id","service_id","trip_id","trip_headsign","shape_id","direction_id"]));
+  zip.file("stop_times.txt", csvify(stopTimesOut, ["trip_id","arrival_time","departure_time","stop_id","stop_sequence"]));
 
-  const blob = await zip.generateAsync({ type: "blob" });
+  if (shapesOut.length) {
+    zip.file("shapes.txt", csvify(
+      shapesOut.map(p => ({ shape_id: p.shape_id, shape_pt_lat: p.lat, shape_pt_lon: p.lon, shape_pt_sequence: p.seq })),
+      ["shape_id","shape_pt_lat","shape_pt_lon","shape_pt_sequence"]
+    ));
+  }
+
+  // 6) Compressed ZIP
+  const blob = await zip.generateAsync({
+    type: "blob",
+    compression: "DEFLATE",
+    compressionOptions: { level: 9 }
+  });
   saveAs(blob, "gtfs.zip");
 }
 
@@ -569,6 +687,12 @@ export default function App() {
   const [drawMode, setDrawMode] = useState(false);
   const [nextStopName, setNextStopName] = useState<string>("");
   const [showRoutes, setShowRoutes] = useState<boolean>(true);
+
+  // --- Export options (UI) ---
+  const [exportOnlySelectedRoutes, setExportOnlySelectedRoutes] = useState<boolean>(false);
+  const [exportPruneUnused, setExportPruneUnused] = useState<boolean>(true);
+  const [exportRoundCoords, setExportRoundCoords] = useState<boolean>(true);
+  const [exportDecimateShapes, setExportDecimateShapes] = useState<boolean>(true);
 
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
   const [selectedRouteIds, setSelectedRouteIds] = useState<Set<string>>(new Set()); // NEW multi-select
@@ -1059,7 +1183,25 @@ export default function App() {
     withBusy("Preparing GTFS…", async () => {
       const { errors } = runValidation();
       if (errors.length) { alert("Fix validation errors before exporting."); return; }
-      await exportGTFSZip({ agencies, stops, routes, services, trips, stopTimes, shapePts });
+
+      const onlyRoutes = exportOnlySelectedRoutes
+        ? new Set<string>(
+            selectedRouteIds.size
+              ? Array.from(selectedRouteIds)
+              : (selectedRouteId ? [selectedRouteId] : [])
+          )
+        : undefined;
+
+      await exportGTFSZip(
+        { agencies, stops, routes, services, trips, stopTimes, shapePts },
+        {
+          onlyRoutes,
+          pruneUnused: exportPruneUnused,
+          roundCoords: exportRoundCoords,
+          decimateShapes: exportDecimateShapes,
+          maxShapePts: 2000,
+        }
+      );
     });
 
   const resetAll = () => {
@@ -1526,6 +1668,26 @@ export default function App() {
 
           <button className="btn btn-primary" onClick={onExportGTFS}>Export GTFS .zip</button>
           <button className="btn" onClick={exportGtfsCompiled}>Export GTFS (compile OD)</button>
+
+                    {/* Export options */}
+          <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", background: "#f7f8fa", padding: "6px 10px", borderRadius: 10 }}>
+            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="checkbox" checked={exportOnlySelectedRoutes} onChange={e=>setExportOnlySelectedRoutes(e.target.checked)} />
+              Only selected route(s)
+            </label>
+            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="checkbox" checked={exportPruneUnused} onChange={e=>setExportPruneUnused(e.target.checked)} />
+              Prune unused rows
+            </label>
+            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="checkbox" checked={exportRoundCoords} onChange={e=>setExportRoundCoords(e.target.checked)} />
+              Round shape coords
+            </label>
+            <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="checkbox" checked={exportDecimateShapes} onChange={e=>setExportDecimateShapes(e.target.checked)} />
+              Decimate long shapes
+            </label>
+          </div>
 
           <button
             className="btn"
