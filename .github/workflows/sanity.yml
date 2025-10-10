@@ -1,8 +1,8 @@
 name: CI Sanity
 on:
+  workflow_dispatch: {}
   push:
-    branches: [ main, AutomaticImports ]
-  workflow_dispatch:
+    branches: [ AutomaticImports-fix ]
 
 jobs:
   hello:
