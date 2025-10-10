@@ -2,6 +2,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>GTFS Admin — Upload overrides.json</title>
+
 <style>
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; }
   .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,.05); }
@@ -30,6 +31,7 @@
     <div style="display:flex; gap:8px; margin-top:12px;">
       <button type="submit" class="primary">Upload & Commit</button>
       <button type="button" id="previewBtn">Preview JSON</button>
+      <button id="clearSaved" type="button">Clear saved form</button>
     </div>
   </form>
 
@@ -100,5 +102,42 @@
     } catch (err) {
       result.innerHTML = "<div style='color:#b91c1c'>Error:</div><pre>" + err.message + "</pre>";
     }
+  });
+
+  // keys we want to remember locally (safe ones only)
+  const FIELDS = ["adminKey", "repoOwner", "repoName", "targetBranch", "overridesPath", "commitMessage", "overridesJson"];
+  const LS_KEY = "gtfs_admin_uploader_v1";
+
+  function loadSaved() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
+      FIELDS.forEach(k => {
+        const el = document.getElementById(k);
+        if (el && saved[k] != null) el.value = saved[k];
+      });
+    } catch {}
+  }
+
+  function saveNow() {
+    const bag = {};
+    FIELDS.forEach(k => {
+      const el = document.getElementById(k);
+      if (el) bag[k] = el.value;
+    });
+    localStorage.setItem(LS_KEY, JSON.stringify(bag));
+  }
+
+  window.addEventListener("DOMContentLoaded", () => {
+    loadSaved();
+    FIELDS.forEach(k => {
+      const el = document.getElementById(k);
+      if (el) el.addEventListener("input", saveNow);
+    });
+    // optional: clear button
+    const clearBtn = document.getElementById("clearSaved");
+    if (clearBtn) clearBtn.addEventListener("click", () => {
+      localStorage.removeItem(LS_KEY);
+      FIELDS.forEach(k => { const el = document.getElementById(k); if (el) el.value = ""; });
+    });
   });
 </script>

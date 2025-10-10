@@ -816,6 +816,36 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // If selectedRouteId no longer exists, clear it (and the multiselect)
+  useEffect(() => {
+    if (selectedRouteId && !routes.some(r => r.route_id === selectedRouteId)) {
+      setSelectedRouteId(null);
+      setSelectedRouteIds(new Set());
+    }
+  }, [routes, selectedRouteId]);
+
+  // If selected stop no longer exists, clear it
+  useEffect(() => {
+    if (selectedStopId && !stops.some(s => s.stop_id === selectedStopId)) {
+      setSelectedStopId(null);
+    }
+  }, [stops, selectedStopId]);
+
+  // If service chips were set for a previously selected route, prune to what's still valid
+  useEffect(() => {
+    if (!selectedRouteId) {
+      if (activeServiceIds.size) setActiveServiceIds(new Set());
+      return;
+    }
+    const valid = new Set(
+      trips.filter(t => t.route_id === selectedRouteId).map(t => t.service_id)
+    );
+    let changed = false;
+    const next = new Set<string>();
+    activeServiceIds.forEach(id => { if (valid.has(id)) next.add(id); else changed = true; });
+    if (changed) setActiveServiceIds(next);
+  }, [selectedRouteId, trips]); 
+
   /** ---------- Validation ---------- */
   function validateFeed(ctx: {
     agencies: Agency[]; stops: Stop[]; routes: RouteRow[]; services: Service[];
@@ -913,6 +943,21 @@ export default function App() {
 
   /** Delete a route and its dependent data */
   const hardDeleteRoute = (route_id: string) => {
+    // figure out which trips/stops will go away BEFORE we mutate state
+    const doomedTrips = trips.filter(t => t.route_id === route_id).map(t => t.trip_id);
+    const doomedTripSet = new Set(doomedTrips);
+    const doomedKeys = new Set<string>();
+    stopTimes.forEach(st => { if (doomedTripSet.has(st.trip_id)) doomedKeys.add(`${st.trip_id}::${st.stop_id}`); });
+
+    // purge restrictions for those (trip,stop) pairs
+    setProject((prev: any) => {
+      const curr: Record<string, any> = prev?.extras?.restrictions ?? {};
+      const next: Record<string, any> = { ...curr };
+      doomedKeys.forEach(k => { delete next[k]; });
+      return { ...(prev ?? {}), extras: { ...(prev?.extras ?? {}), restrictions: next } };
+    });
+
+    // now prune the GTFS tables
     const remainingTrips = trips.filter(t => t.route_id !== route_id);
     const remainingTripIds = new Set(remainingTrips.map(t => t.trip_id));
     setTrips(remainingTrips);
@@ -922,11 +967,9 @@ export default function App() {
       return prev.filter(s => keptShapeIds.has(s.shape_id));
     });
     setRoutes(prev => prev.filter(r => r.route_id !== route_id));
-    setSelectedRouteIds(prev => {
-      const n = new Set(prev);
-      n.delete(route_id);
-      return n;
-    });
+
+    // clean up selections
+    setSelectedRouteIds(prev => { const n = new Set(prev); n.delete(route_id); return n; });
     if (selectedRouteId === route_id) setSelectedRouteId(null);
   };
 
@@ -1384,16 +1427,15 @@ export default function App() {
           stopTimes={stopTimes.filter(st =>
             (tripsByRoute.get(selectedRouteId) ?? []).some(t => t.trip_id === st.trip_id)
           )}
-          selectedRouteId={selectedRouteId}
-          initialRestrictions={project?.extras?.restrictions}
+          selectedRouteId={routes.some(r => r.route_id === selectedRouteId) ? selectedRouteId : null}
+          initialRestrictions={project?.extras?.restrictions ?? {}}
           onRestrictionsChange={handleRestrictionsChange}
-
           onEditTime={(trip_id, stop_id, newUiTime) => {
             setStopTimes(prev => prev.map(st =>
               st.trip_id === trip_id && st.stop_id === stop_id
                 ? {
                     ...st,
-                    departure_time: newUiTime, // HH:MM
+                    departure_time: newUiTime,
                     arrival_time: st.arrival_time ? st.arrival_time : newUiTime,
                   }
                 : st
