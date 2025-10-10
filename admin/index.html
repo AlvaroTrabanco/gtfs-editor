@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Flixbus Overrides Uploader (private)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 720px; margin: 32px auto; padding: 0 16px; }
+  h1 { font-size: 22px; margin: 0 0 8px; }
+  .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; box-shadow: 0 2px 10px rgba(0,0,0,.04); }
+  label { display: block; margin: 10px 0 4px; font-weight: 600; }
+  input[type="text"] { width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 8px; }
+  input[type="file"] { display: block; margin-top: 6px; }
+  button { margin-top: 14px; padding: 10px 14px; border-radius: 10px; border: 1px solid #d1d5db; background: #111827; color: #fff; cursor: pointer; }
+  .muted { color: #6b7280; font-size: 13px; }
+  .ok { color: #065f46; }
+  .err { color: #991b1b; }
+  pre { background: #0b1020; color: #cbd5e1; padding: 12px; border-radius: 10px; overflow:auto; }
+</style>
+
+<h1>Flixbus Overrides Uploader</h1>
+<p class="muted">Private admin tool to update <code>automation/overrides.json</code> in GitHub and trigger the workflow.</p>
+
+<div class="card">
+  <label>Admin key (keep secret)</label>
+  <input id="adminKey" type="text" placeholder="Enter your admin key" autocomplete="off" />
+
+  <label>Commit message</label>
+  <input id="message" type="text" value="Update overrides.json" />
+
+  <label>Select overrides.json</label>
+  <input id="file" type="file" accept="application/json" />
+
+  <button id="uploadBtn">Upload & Commit</button>
+
+  <div id="out" class="muted" style="margin-top: 14px;"></div>
+  <pre id="log" style="display:none"></pre>
+</div>
+
+<script>
+const out = document.getElementById('out');
+const log = document.getElementById('log');
+document.getElementById('uploadBtn').addEventListener('click', async () => {
+  out.textContent = '';
+  log.style.display = 'none';
+  const adminKey = document.getElementById('adminKey').value.trim();
+  const message = document.getElementById('message').value.trim();
+  const fileEl = document.getElementById('file');
+  if (!adminKey) { out.innerHTML = '<span class="err">Missing admin key.</span>'; return; }
+  if (!fileEl.files.length) { out.innerHTML = '<span class="err">Please choose a JSON file.</span>'; return; }
+  const file = fileEl.files[0];
+  const text = await file.text();
+
+  try {
+    JSON.parse(text); // sanity check
+  } catch {
+    out.innerHTML = '<span class="err">File is not valid JSON.</span>';
+    return;
+  }
+
+  out.textContent = 'Uploading…';
+  const res = await fetch('/.netlify/functions/upload-overrides', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-admin-key': adminKey },
+    body: JSON.stringify({ message, content: text })
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    out.innerHTML = `<span class="err">Failed (${res.status}).</span>`;
+    log.style.display = 'block';
+    log.textContent = JSON.stringify(data, null, 2);
+    return;
+  }
+  out.innerHTML = `<span class="ok">OK!</span> Commit: <code>${data.commitSha || '(n/a)'}</code>`;
+  if (data.htmlUrl) out.innerHTML += ` — <a target="_blank" href="${data.htmlUrl}">View file</a>`;
+});
+</script>
