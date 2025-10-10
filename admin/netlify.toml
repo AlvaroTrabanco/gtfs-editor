@@ -1,0 +1,4 @@
+[build]
+  base = "admin"
+  publish = "admin"
+  functions = "admin/netlify/functions"
