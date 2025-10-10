@@ -4,7 +4,8 @@
   "type": "module",
   "private": true,
   "dependencies": {
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "@octokit/rest": "^21.0.0"
   },
   "engines": {
     "node": ">=18"
