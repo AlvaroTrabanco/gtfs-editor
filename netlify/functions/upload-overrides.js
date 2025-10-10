@@ -6,13 +6,13 @@
 import fetch from "node-fetch";
 
 const {
-  ADMIN_KEY,          // your secret gate (set in Netlify)
-  GITHUB_TOKEN,       // PAT with contents:write on repo
+  ADMIN_KEY,
+  GITHUB_TOKEN,
   REPO_OWNER = "AlvaroTrabanco",
   REPO_NAME  = "gtfs-editor",
-  BRANCH     = "main",
+  TARGET_BRANCH = "main",
   OVERRIDES_PATH = "automation/overrides.json",
-  ALLOW_ORIGIN // optional: e.g., https://your-admin-site.netlify.app
+  ALLOW_ORIGIN
 } = process.env;
 
 const okJson = (status, body, origin) => ({
@@ -65,7 +65,7 @@ export const handler = async (event) => {
   const baseUrl = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${encodeURIComponent(OVERRIDES_PATH)}`;
   let sha = undefined;
 
-  const getRes = await fetch(`${baseUrl}?ref=${encodeURIComponent(BRANCH)}`, {
+  const getRes = await fetch(`${baseUrl}?ref=${encodeURIComponent(TARGET_BRANCH)}`, {
     headers: { "Authorization": `Bearer ${GITHUB_TOKEN}`, "Accept": "application/vnd.github+json" }
   });
 
@@ -86,7 +86,7 @@ export const handler = async (event) => {
     body: JSON.stringify({
       message,
       content: Buffer.from(contentText).toString("base64"),
-      branch: BRANCH,
+      branch: TARGET_BRANCH,
       sha
     })
   });
