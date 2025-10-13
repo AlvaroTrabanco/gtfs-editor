@@ -61,6 +61,9 @@ type ODRestriction = {
 };
 type RestrictionsMap = Record<string, ODRestriction>;
 
+type StopDefaultsMap = Record<string, ODRestriction>;
+
+
 
 /** ---------- Helpers ---------- */
 function normalizeRule(raw: any): ODRestriction {
@@ -628,7 +631,7 @@ function ServiceChip({
 
 /** ---------- App ---------- */
 export default function App() {
-  const [project, setProject] = useState<any>({ extras: { restrictions: {} } });
+  const [project, setProject] = useState<any>({ extras: { restrictions: {}, stopDefaults: {} as StopDefaultsMap } });
 
   const handleRestrictionsChange = useCallback((map: Record<string, any>) => {
     setProject((prev: any) => ({
@@ -636,6 +639,23 @@ export default function App() {
       extras: { ...(prev?.extras ?? {}), restrictions: map },
     }));
   }, []);
+
+  const handleStopDefaultChange = useCallback((stop_id: string, nextRule: ODRestriction | null) => {
+    setProject((prev: any) => {
+      const curr: StopDefaultsMap = prev?.extras?.stopDefaults ?? {};
+      const next: StopDefaultsMap = { ...curr };
+      if (nextRule) next[stop_id] = nextRule;
+      else delete next[stop_id];
+      return {
+        ...(prev ?? {}),
+        extras: { ...(prev?.extras ?? {}), stopDefaults: next }
+      };
+    });
+  }, []);
+
+  const getStopDefault = useCallback((stop_id: string): ODRestriction | undefined => {
+    return (project?.extras?.stopDefaults ?? {})[stop_id];
+  }, [project?.extras?.stopDefaults]);
 
 
   useEffect(() => {
@@ -767,9 +787,17 @@ export default function App() {
           obj.extras?.restrictions ??
           obj.restrictions ??
           {};
+        const savedStopDefaults: StopDefaultsMap =
+          obj.project?.extras?.stopDefaults ??
+          obj.extras?.stopDefaults ??
+          {};
         setProject((prev: any) => ({
           ...(prev ?? {}),
-          extras: { ...(prev?.extras ?? {}), restrictions: savedRules },
+          extras: {
+            ...(prev?.extras ?? {}),
+            restrictions: savedRules,
+            stopDefaults: savedStopDefaults,
+          },
         }));
       }
     } catch {
@@ -795,7 +823,12 @@ export default function App() {
           trips,
           stopTimes,
           shapePts,
-          project: { extras: { restrictions: project?.extras?.restrictions ?? {} } },
+          project: {
+            extras: {
+              restrictions: project?.extras?.restrictions ?? {},
+              stopDefaults: project?.extras?.stopDefaults ?? {},
+            }
+          },
         };
         const json = JSON.stringify(snapshot);
         if (json.length >= 5_000_000) {
@@ -1180,29 +1213,11 @@ export default function App() {
   };
 
   const onExportGTFS = async () =>
-    withBusy("Preparing GTFS…", async () => {
-      const { errors } = runValidation();
-      if (errors.length) { alert("Fix validation errors before exporting."); return; }
-
-      const onlyRoutes = exportOnlySelectedRoutes
-        ? new Set<string>(
-            selectedRouteIds.size
-              ? Array.from(selectedRouteIds)
-              : (selectedRouteId ? [selectedRouteId] : [])
-          )
-        : undefined;
-
-      await exportGTFSZip(
-        { agencies, stops, routes, services, trips, stopTimes, shapePts },
-        {
-          onlyRoutes,
-          pruneUnused: exportPruneUnused,
-          roundCoords: exportRoundCoords,
-          decimateShapes: exportDecimateShapes,
-          maxShapePts: 2000,
-        }
-      );
-    });
+  withBusy("Preparing GTFS…", async () => {
+    const { errors } = runValidation();
+    if (errors.length) { alert("Fix validation errors before exporting."); return; }
+    await exportGtfsCompiled(); // ← always export the compiled OD version
+  });
 
   const resetAll = () => {
     if (!confirm("Reset project?")) return;
@@ -1212,7 +1227,7 @@ export default function App() {
     setSelectedRouteIds(new Set());
     setSelectedStopId(null);
     setActiveServiceIds(new Set());
-    setClearSignal(x => x + 1);
+    setClearSignal((x: number) => x + 1)
   };
 
   /** Edit a time (updates stop_times), store HH:MM:00 or "" */
@@ -1667,7 +1682,6 @@ export default function App() {
           </label>
 
           <button className="btn btn-primary" onClick={onExportGTFS}>Export GTFS .zip</button>
-          <button className="btn" onClick={exportGtfsCompiled}>Export GTFS (compile OD)</button>
 
                     {/* Export options */}
           <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", background: "#f7f8fa", padding: "6px 10px", borderRadius: 10 }}>
@@ -1905,16 +1919,21 @@ export default function App() {
           selectedRouteId={routes.some(r => r.route_id === selectedRouteId) ? selectedRouteId : null}
           initialRestrictions={project?.extras?.restrictions ?? {}}
           onRestrictionsChange={handleRestrictionsChange}
+          initialStopDefaults={project?.extras?.stopDefaults ?? {}}
+          onStopDefaultsChange={(map) =>
+            setProject((prev: any) => ({
+              ...(prev ?? {}),
+              extras: { ...(prev?.extras ?? {}), stopDefaults: map },
+            }))
+          }
           onEditTime={(trip_id, stop_id, newUiTime) => {
-            setStopTimes(prev => prev.map(st =>
-              st.trip_id === trip_id && st.stop_id === stop_id
-                ? {
-                    ...st,
-                    departure_time: newUiTime,
-                    arrival_time: st.arrival_time ? st.arrival_time : newUiTime,
-                  }
-                : st
-            ));
+            setStopTimes((prev) =>
+              prev.map((st) =>
+                st.trip_id === trip_id && st.stop_id === stop_id
+                  ? { ...st, departure_time: newUiTime, arrival_time: st.arrival_time ? st.arrival_time : newUiTime }
+                  : st
+              )
+            );
           }}
         />
       ) : (

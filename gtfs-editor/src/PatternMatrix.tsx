@@ -46,6 +46,7 @@ type ODRestriction = {
   pickupOnlyTo?: string[];     // destinations where boarding here is allowed
 };
 type RestrictionsMap = Record<string, ODRestriction>;
+type StopDefaultsMap = Record<string, ODRestriction>;
 const keyTS = (trip_id: string, stop_id: string) => `${trip_id}::${stop_id}`;
 
 /* ---------------- Props ---------------- */
@@ -58,6 +59,10 @@ type PatternMatrixProps = {
 
   initialRestrictions?: RestrictionsMap;
   onRestrictionsChange?: (next: RestrictionsMap) => void;
+
+  /** NEW: per-stop defaults */
+  initialStopDefaults?: StopDefaultsMap;
+  onStopDefaultsChange?: (next: StopDefaultsMap) => void;
 
   // Optional: use your app’s time writeback; if omitted, we keep a local shadow so UI still edits.
   onEditTime?: (trip_id: string, stop_id: string, newUiTime: string) => void;
@@ -402,7 +407,9 @@ function StopBulkRuleEditor({
 /* ---------------- Main component ---------------- */
 export default function PatternMatrix({
   stops, services, trips, stopTimes, selectedRouteId,
-  initialRestrictions, onRestrictionsChange, onEditTime
+  initialRestrictions, onRestrictionsChange,
+  initialStopDefaults, onStopDefaultsChange,
+  onEditTime,
 }: PatternMatrixProps) {
   /* ---------- Base indexing ---------- */
   const tripsFiltered = useMemo(
@@ -492,6 +499,9 @@ export default function PatternMatrix({
 
   const [restrictions, setRestrictions] = useState<RestrictionsMap>(initialRestrictions ?? {});
   useEffect(() => { onRestrictionsChange?.(restrictions); }, [restrictions, onRestrictionsChange]);
+  /** NEW: per-stop saved defaults */
+  const [stopDefaults, setStopDefaults] = useState<StopDefaultsMap>(initialStopDefaults ?? {});
+  useEffect(() => { onStopDefaultsChange?.(stopDefaults); }, [stopDefaults, onStopDefaultsChange]);
 
   const [openCellKey, setOpenCellKey] = useState<string | null>(null);
   const [openBulkKey, setOpenBulkKey] = useState<string | null>(null);
@@ -539,6 +549,22 @@ export default function PatternMatrix({
       }
       return next;
     });
+    // NEW: persist row default for this stop_id
+    if (bulkMode === "normal") {
+      setStopDefaults(prev => {
+        const n = { ...prev };
+        delete n[stop_id];
+        return n;
+      });
+    } else if (bulkMode === "pickup" || bulkMode === "dropoff") {
+      setStopDefaults(prev => ({ ...prev, [stop_id]: { mode: bulkMode } }));
+    } else {
+      // custom — store exactly what user set in the bulk editor
+      setStopDefaults(prev => ({
+        ...prev,
+        [stop_id]: { mode: "custom", dropoffOnlyFrom: bulkDropFrom.slice(), pickupOnlyTo: bulkPickTo.slice() }
+      }));
+    }
     setOpenBulkKey(null);
   };
 
@@ -627,9 +653,23 @@ export default function PatternMatrix({
                             setBulkAnchorEl(e.currentTarget as HTMLElement);
                             const rowKey = `${gi}::${sid}`;
                             setOpenBulkKey((cur: string | null) => (cur === rowKey ? null : rowKey));
-                            setBulkMode("normal");
-                            setBulkDropFrom([]);
-                            setBulkPickTo([]);
+
+                            // NEW: preload from saved defaults for this stop (if any)
+                            const def = stopDefaults[sid];
+                            if (!def || def.mode === "normal") {
+                              setBulkMode("normal");
+                              setBulkDropFrom([]);
+                              setBulkPickTo([]);
+                            } else if (def.mode === "pickup" || def.mode === "dropoff") {
+                              setBulkMode(def.mode);
+                              setBulkDropFrom([]);
+                              setBulkPickTo([]);
+                            } else {
+                              // custom
+                              setBulkMode("custom");
+                              setBulkDropFrom(def.dropoffOnlyFrom ?? []);
+                              setBulkPickTo(def.pickupOnlyTo ?? []);
+                            }
                           }}
                           style={{ border: "1px solid #ddd", background: "#fff", borderRadius: 6, padding: "2px 6px", fontSize: 11, cursor: "pointer" }}
                           >
@@ -665,7 +705,7 @@ export default function PatternMatrix({
                       const base = hhmmOnly(st?.departure_time || st?.arrival_time || "");
                       const ui = hhmmOnly(getUiTime(t.trip_id, sid, base));
                       const k = keyTS(t.trip_id, sid);
-                      const rule = restrictions[k]?.mode ?? "normal";
+                      const rule = restrictions[k]?.mode ?? stopDefaults[sid]?.mode ?? "normal";
                       const cellKey = `${gi}::${t.trip_id}::${sid}`;
                       const isOpen = openCellKey === cellKey;
 
